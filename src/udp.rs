@@ -17,6 +17,9 @@ use crate::{config, identity, ppv2};
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::sync::Arc;
 
+/// The ABI's status enum, aliased for the same reason as in tcp.rs.
+type Status = abi::envoy_dynamic_module_type_on_udp_listener_filter_status;
+
 pub struct FilterConfig {
     pub cfg: Arc<config::Config>,
 }
@@ -25,31 +28,45 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for FilterConfig 
     fn new_udp_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn UdpListenerFilter<ELF>> {
         Box::new(Filter {
             cfg: self.cfg.clone(),
+            payload: Vec::new(),
         })
     }
 }
 
 pub struct Filter {
     cfg: Arc<config::Config>,
+    /// The stripped payload, reused across datagrams instead of allocated per
+    /// one. Sound because the filter chain is built once per listener per worker
+    /// (createUdpListenerFilterChain), not per datagram, and a worker is single
+    /// threaded -- so this outlives every on_data and is never shared.
+    payload: Vec<u8>,
+}
+
+/// What one on_data pass decided, mirroring tcp.rs. Three outcomes and one
+/// exhaustive match, rather than an Option that has to carry the payload and a
+/// bare `return` from inside the block that computes it.
+enum Decision {
+    /// Header parsed and the allowlist covers it; the stripped payload is
+    /// already staged in `self.payload`.
+    Forward,
+    /// Parsed, but no `allow` rule covers the identity.
+    Denied,
+    /// Not PPv2 at all.
+    NotProxyProtocol,
 }
 
 impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
-    fn on_data(
-        &mut self,
-        envoy: &mut ELF,
-    ) -> abi::envoy_dynamic_module_type_on_udp_listener_filter_status {
-        use abi::envoy_dynamic_module_type_on_udp_listener_filter_status as Status;
-
+    fn on_data(&mut self, envoy: &mut ELF) -> Status {
         // Envoy may hand the datagram over as several chunks. The SDK enumerates
         // them, so unlike the Zig version there is no hand-rolled flatten() and
         // the single-chunk case -- which is every real datagram from an NLB --
         // costs no allocation at all.
         let decision = {
             let (chunks, total) = envoy.get_datagram_data();
-            if total < 16 {
+            if total < ppv2::PREAMBLE {
                 return Status::StopIteration;
             }
-            let owned: Option<Vec<u8>> = if chunks.len() == 1 {
+            let joined: Option<Vec<u8>> = if chunks.len() == 1 {
                 None
             } else {
                 let mut v = Vec::with_capacity(total);
@@ -58,7 +75,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
                 }
                 Some(v)
             };
-            let buf: &[u8] = match &owned {
+            let buf: &[u8] = match &joined {
                 Some(v) => v,
                 None => chunks[0].as_slice(),
             };
@@ -67,26 +84,26 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
             match ppv2::parse(buf) {
                 Ok(h) => {
                     let addr = identity::synthesize(self.cfg.prefix, &h);
-                    if !self.cfg.allow.contains(identity::to_u128(addr)) {
+                    if self.cfg.allow.contains(identity::to_u128(addr)) {
+                        self.payload.clear();
+                        self.payload.extend_from_slice(&buf[h.len..]);
+                        Decision::Forward
+                    } else {
                         // Allowlist only, like a security group: allowed iff a
                         // rule covers it, so an empty list denies everything.
                         // Never gate this on the list being non-empty.
-                        return Status::StopIteration;
+                        Decision::Denied
                     }
-                    Some(buf[h.len..].to_vec())
                 }
-                Err(_) => None,
+                Err(_) => Decision::NotProxyProtocol,
             }
         };
 
         match decision {
-            Some(payload) => {
-                if !envoy.set_datagram_data(&payload) {
-                    return Status::StopIteration;
-                }
-                Status::Continue
-            }
-            None => {
+            Decision::Forward if envoy.set_datagram_data(&self.payload) => Status::Continue,
+            Decision::Forward => Status::StopIteration,
+            Decision::Denied => Status::StopIteration,
+            Decision::NotProxyProtocol => {
                 if self.cfg.require_ppv2 {
                     Status::StopIteration
                 } else {

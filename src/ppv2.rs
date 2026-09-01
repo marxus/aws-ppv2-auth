@@ -40,6 +40,20 @@
 //! receiver must not start to parse an address before the whole address block is
 //! received." So this reads incrementally and parses only once complete, never
 //! the other way round.
+//!
+//! # Performance
+//!
+//! Two shapes in `parse` look like they could be tidier and are not, both
+//! measured on a 112-byte PrivateLink header:
+//!
+//!   * The short-buffer case is handled separately so the common path keeps a
+//!     CONSTANT-length signature compare. Folding the two into one
+//!     `buf[..n] != SIGNATURE[..n]` reads better and costs 2x (4.4 -> 9.1 ns),
+//!     because a runtime length turns the compare into a memcmp call.
+//!   * `addr_size` is a runtime value rather than two constant-folded paths for
+//!     the two families. That costs ~3ns, because the address copy then takes a
+//!     runtime length -- 0.03ms per second at 10k conn/s, and it halves the
+//!     function.
 
 pub const SIGNATURE: [u8; 12] = [
     0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
@@ -48,8 +62,18 @@ pub const SIGNATURE: [u8; 12] = [
 pub const TLV_AWS: u8 = 0xea;
 pub const AWS_SUBTYPE_VPCE_ID: u8 = 0x01;
 
+/// Signature (12) + version/command (1) + family/transport (1) + length (2).
+/// The payload of a complete header starts at `PREAMBLE + body_len`.
+pub const PREAMBLE: usize = 16;
+
 /// Version 2 + PROXY. The only 13th byte an NLB ever sends.
 const V2_PROXY: u8 = 0x21;
+
+/// A TLV is one type byte plus a two-byte length, then that many value bytes.
+const TLV_HEADER: usize = 3;
+
+/// The address block carries a source and destination port after the addresses.
+const PORTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -75,28 +99,26 @@ pub struct Header<'a> {
 }
 
 pub fn parse(buf: &[u8]) -> Result<Header<'_>, Error> {
-    // The short-buffer case is handled first and separately, so the common path
-    // keeps a CONSTANT-length signature compare. Folding the two into one
-    // `buf[..n] != SIGNATURE[..n]` reads better and costs 2x on Parse (4.4 ->
-    // 9.1 ns measured), because a runtime length turns it into a memcmp call.
-    if buf.len() < 16 {
+    // Short buffer first and separately -- see the module's Performance note
+    // before folding this into the compare below.
+    if buf.len() < PREAMBLE {
         // Reject a client that is not speaking PPv2 on its first bytes, rather
-        // than stalling until 16 arrive.
+        // than stalling until the whole preamble arrives.
         let n = buf.len().min(SIGNATURE.len());
         if buf[..n] != SIGNATURE[..n] {
             return Err(Error::Invalid);
         }
-        return Err(Error::Need(16));
+        return Err(Error::Need(PREAMBLE));
     }
     if buf[..12] != SIGNATURE || buf[12] != V2_PROXY {
         return Err(Error::Invalid);
     }
 
-    let len = 16 + u16::from_be_bytes([buf[14], buf[15]]) as usize;
+    let len = PREAMBLE + u16::from_be_bytes([buf[14], buf[15]]) as usize;
     if buf.len() < len {
         return Err(Error::Need(len));
     }
-    let body = &buf[16..len];
+    let body = &buf[PREAMBLE..len];
 
     // Byte 13 is family << 4 | transport; only the family is load-bearing.
     let is_v6 = match buf[13] >> 4 {
@@ -106,47 +128,49 @@ pub fn parse(buf: &[u8]) -> Result<Header<'_>, Error> {
     };
     // The block is src, dst, sport, dport -- so the source port sits at twice
     // the address size, and the whole block is that plus the two ports. One code
-    // path for both families rather than two constant-folded ones, which costs
-    // ~3ns on Parse because the copy below takes a runtime length. Deliberate:
-    // that is 0.03ms per second at 10k conn/s, and it halves this function.
+    // path for both families, deliberately; see the module's Performance note.
     let addr_size = if is_v6 { 16 } else { 4 };
-    let addr_len = addr_size * 2 + 4;
-    if body.len() < addr_len {
+    let block_len = addr_size * 2 + PORTS;
+    if body.len() < block_len {
         return Err(Error::Invalid);
     }
 
     let mut src = [0u8; 16];
     src[..addr_size].copy_from_slice(&body[..addr_size]);
-    let sp = addr_size * 2;
-    let src_port = u16::from_be_bytes([body[sp], body[sp + 1]]);
-
-    // Walk the TLVs for the AWS endpoint id. A trailer claiming more than is
-    // present stops the walk rather than failing the header: AWS pads with NOOP
-    // to a fixed size, so length alone tells you nothing.
-    let mut vpce: &[u8] = &[];
-    let mut i = addr_len;
-    while i + 3 <= body.len() {
-        let tl = u16::from_be_bytes([body[i + 1], body[i + 2]]) as usize;
-        let end = i + 3 + tl;
-        if end > body.len() {
-            break;
-        }
-        if body[i] == TLV_AWS && tl > 1 && body[i + 3] == AWS_SUBTYPE_VPCE_ID {
-            // First wins, and stop. Nothing after this is read, and leaving it
-            // as last-wins meant a duplicate 0xEA decided the identity -- an
-            // ambiguity worth pinning down even though forging a second TLV
-            // requires the same access as forging the first.
-            vpce = &body[i + 4..end];
-            break;
-        }
-        i = end;
-    }
+    let port_off = addr_size * 2;
+    let src_port = u16::from_be_bytes([body[port_off], body[port_off + 1]]);
 
     Ok(Header {
         len,
         src,
         src_port,
         is_v6,
-        vpce,
+        vpce: find_vpce(&body[block_len..]),
     })
+}
+
+/// The AWS endpoint id from the 0xEA TLV, or empty.
+///
+/// Hostile input, not AWS input, decides the shape of this: a TLV claiming a
+/// length past the end of the buffer stops the walk instead of indexing out of
+/// range. Failing the whole header instead would be wrong -- AWS pads with NOOP
+/// to a fixed size, so a trailer's length alone tells you nothing.
+///
+/// First match wins and the walk stops. Nothing after it is read, and last-wins
+/// let a duplicate 0xEA decide the identity.
+fn find_vpce(tlvs: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i + TLV_HEADER <= tlvs.len() {
+        let value_len = u16::from_be_bytes([tlvs[i + 1], tlvs[i + 2]]) as usize;
+        let end = i + TLV_HEADER + value_len;
+        if end > tlvs.len() {
+            break;
+        }
+        // value_len > 1 so the subtype byte exists and the id is non-empty.
+        if tlvs[i] == TLV_AWS && value_len > 1 && tlvs[i + TLV_HEADER] == AWS_SUBTYPE_VPCE_ID {
+            return &tlvs[i + TLV_HEADER + 1..end];
+        }
+        i = end;
+    }
+    &[]
 }

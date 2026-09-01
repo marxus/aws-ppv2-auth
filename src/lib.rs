@@ -53,17 +53,7 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
     _name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn ListenerFilterConfig<ELF>>> {
-    let cfg = parse_config(config_bytes)?;
-    // The TCP filter has no enforcement point -- it labels, and a SecurityPolicy
-    // matches downstream. An `allow` line here would be a security rule that
-    // reads as applied and does nothing, so fail the listener instead.
-    if !cfg.allow.is_empty() {
-        eprintln!(
-            "aws-ppv2-identity: `allow` is UDP-only; the TCP filter cannot enforce it. \
-             Match the synthesized address in a SecurityPolicy instead."
-        );
-        return None;
-    }
+    let cfg = load(config_bytes, Filter::Tcp)?;
     Some(Box::new(tcp::FilterConfig { cfg }))
 }
 
@@ -72,27 +62,43 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
     _name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
-    let cfg = parse_config(config_bytes)?;
+    let cfg = load(config_bytes, Filter::Udp)?;
     Some(Box::new(udp::FilterConfig { cfg }))
 }
 
-/// Envoy rejects the listener when this returns None but says nothing about
-/// why, and an ABI mismatch only warns -- so a silent failure here is a module
-/// that does not load with no thread to pull. stderr is the one channel a
-/// listener filter config hook has, and Envoy captures it.
-fn parse_config(bytes: &[u8]) -> Option<Arc<config::Config>> {
-    let text = match std::str::from_utf8(bytes) {
-        Ok(t) => t,
-        Err(_) => {
-            eprintln!("aws-ppv2-identity: filter_config is not valid UTF-8");
-            return None;
-        }
-    };
-    match config::parse(text) {
-        Ok(c) => Some(Arc::new(c)),
+/// Which filter is being configured. Only one rule differs between them, but it
+/// is a rule about what the config is allowed to say, so it belongs here rather
+/// than in `config::parse`.
+enum Filter {
+    Tcp,
+    Udp,
+}
+
+/// The single place a config failure becomes a rejected listener.
+///
+/// Envoy says nothing about why it rejected one, and an ABI mismatch only warns,
+/// so a silent failure here is a module that does not load with no thread to
+/// pull. stderr is the one channel a config hook has, and Envoy captures it.
+fn load(bytes: &[u8], which: Filter) -> Option<Arc<config::Config>> {
+    match validate(bytes, which) {
+        Ok(cfg) => Some(Arc::new(cfg)),
         Err(e) => {
             eprintln!("aws-ppv2-identity: bad filter_config: {e}");
             None
         }
     }
+}
+
+/// Fail closed. Do not substitute a default -- an empty allowlist is the
+/// deny-everything state, but a missing `ula` has no safe interpretation.
+fn validate(bytes: &[u8], which: Filter) -> Result<config::Config, &'static str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "filter_config is not valid UTF-8")?;
+    let cfg = config::parse(text)?;
+    // The TCP filter has no enforcement point -- it labels, and a SecurityPolicy
+    // matches downstream. An `allow` line here would be a security rule that
+    // reads as applied and does nothing.
+    if matches!(which, Filter::Tcp) && !cfg.allow.is_empty() {
+        return Err("`allow` is UDP-only; match the synthesized address in a SecurityPolicy");
+    }
+    Ok(cfg)
 }

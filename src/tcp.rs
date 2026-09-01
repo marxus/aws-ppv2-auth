@@ -12,6 +12,11 @@ use crate::{config, identity, ppv2};
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::sync::Arc;
 
+/// The ABI's status enum. Aliased once because the generated name is
+/// `envoy_dynamic_module_type_on_listener_filter_status`, which crowds out the
+/// signature it appears in.
+type Status = abi::envoy_dynamic_module_type_on_listener_filter_status;
+
 pub struct FilterConfig {
     pub cfg: Arc<config::Config>,
 }
@@ -23,7 +28,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for FilterConfig {
         // ignore edits to the EnvoyPatchPolicy.
         Box::new(Filter {
             cfg: self.cfg.clone(),
-            want: 16,
+            want: ppv2::PREAMBLE,
             done: false,
             refused: false,
         })
@@ -60,24 +65,15 @@ enum Decision {
 
 impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Filter {
     /// Always inspect bytes; never Continue straight from accept.
-    fn on_accept(
-        &mut self,
-        _envoy: &mut ELF,
-    ) -> abi::envoy_dynamic_module_type_on_listener_filter_status {
-        abi::envoy_dynamic_module_type_on_listener_filter_status::StopIteration
+    fn on_accept(&mut self, _envoy: &mut ELF) -> Status {
+        Status::StopIteration
     }
 
     fn max_read_bytes(&mut self, _envoy: &mut ELF) -> usize {
         self.want
     }
 
-    fn on_data(
-        &mut self,
-        envoy: &mut ELF,
-        _data_length: usize,
-    ) -> abi::envoy_dynamic_module_type_on_listener_filter_status {
-        use abi::envoy_dynamic_module_type_on_listener_filter_status as Status;
-
+    fn on_data(&mut self, envoy: &mut ELF, _data_length: usize) -> Status {
         // Order matters: refusal wins. StopIteration means "wait for more data",
         // NOT "reject" -- Envoy keeps this filter at the head of the chain and
         // calls on_data again as bytes arrive (active_tcp_socket.cc). So a
