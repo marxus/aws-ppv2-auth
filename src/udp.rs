@@ -1,17 +1,8 @@
-//! UDP listener filter: parse PPv2, enforce, strip.
+//! UDP listener filter: parse PPv2, enforce, strip. Chained before udp_proxy.
 //!
-//! envoy.filters.udp_listener.dynamic_modules, chained BEFORE udp_proxy.
-//!
-//! Enforces here rather than delegating. The UDP ABI is not short of callbacks
-//! -- there are 21, including get_peer_address, send_datagram, get_worker_index
-//! and a full stats surface -- but none of them can attach an identity to the
-//! session, so nothing downstream can read one. udp_proxy's tunneling_config
-//! reads %FILTER_STATE(key)% and a UDP *session* filter could write it, but
-//! there is no dynamic-modules session filter. So enforcement happens in this
-//! filter or nowhere.
-//!
-//! It synthesizes the same address as the TCP filter and matches the same
-//! allowlist format, so one identity scheme covers both paths. See ../README.md.
+//! Enforces here because no UDP callback can attach an identity to a session, so
+//! nothing downstream can read one -- it is this filter or nowhere. Synthesizes
+//! the same address as the TCP filter against the same allowlist format.
 
 use crate::{config, identity, ppv2};
 use envoy_proxy_dynamic_modules_rust_sdk::*;
@@ -35,19 +26,14 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for FilterConfig 
 
 pub struct Filter {
     cfg: Arc<config::Config>,
-    /// The stripped payload, reused across datagrams instead of allocated per
-    /// one. Sound because the filter chain is built once per listener per worker
-    /// (createUdpListenerFilterChain), not per datagram, and a worker is single
-    /// threaded -- so this outlives every on_data and is never shared.
+    /// Reused across datagrams: the filter chain is built once per listener per
+    /// worker, not per datagram, and a worker is single threaded.
     payload: Vec<u8>,
 }
 
-/// What one on_data pass decided, mirroring tcp.rs. Three outcomes and one
-/// exhaustive match, rather than an Option that has to carry the payload and a
-/// bare `return` from inside the block that computes it.
+/// What one on_data pass decided.
 enum Decision {
-    /// Header parsed and the allowlist covers it; the stripped payload is
-    /// already staged in `self.payload`.
+    /// Allowlist covers it; stripped payload is staged in `self.payload`.
     Forward,
     /// Parsed, but no `allow` rule covers the identity.
     Denied,
@@ -57,10 +43,8 @@ enum Decision {
 
 impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
     fn on_data(&mut self, envoy: &mut ELF) -> Status {
-        // Envoy may hand the datagram over as several chunks. The SDK enumerates
-        // them, so unlike the Zig version there is no hand-rolled flatten() and
-        // the single-chunk case -- which is every real datagram from an NLB --
-        // costs no allocation at all.
+        // Several chunks are possible; the single-chunk case -- every real NLB
+        // datagram -- borrows in place and costs no allocation.
         let decision = {
             let (chunks, total) = envoy.get_datagram_data();
             let joined: Option<Vec<u8>> = if chunks.len() == 1 {
@@ -77,11 +61,8 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
                 None => chunks[0].as_slice(),
             };
 
-            // A datagram is self-contained: no "read more" here, unlike TCP, so
-            // a short one is simply not PPv2. Routing it through the same arm as
-            // any other parse failure is what makes require_ppv2 govern every
-            // one of them -- it used to be dropped unconditionally, so a 10-byte
-            // datagram and a 20-byte non-PPv2 datagram were treated differently.
+            // Self-contained: no "read more" here, so a short datagram is simply
+            // not PPv2 and require_ppv2 governs it like any other parse failure.
             match ppv2::parse(buf) {
                 Err(ppv2::Error::Need(_)) => Decision::NotProxyProtocol,
                 Ok(h) => {
@@ -91,9 +72,8 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
                         self.payload.extend_from_slice(&buf[h.len..]);
                         Decision::Forward
                     } else {
-                        // Allowlist only, like a security group: allowed iff a
-                        // rule covers it, so an empty list denies everything.
-                        // Never gate this on the list being non-empty.
+                        // Allowlist only: an empty list denies everything, so
+                        // never gate this on the list being non-empty.
                         Decision::Denied
                     }
                 }

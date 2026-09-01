@@ -7,29 +7,36 @@ description = "Envoy dynamic module: AWS PROXY protocol v2 identity as a matchab
 repository = "https://github.com/marxus/aws-ppv2-identity"
 
 [dependencies]
-# PINNED TO THE ENVOY THIS RUNS IN, and that is not a style choice -- upstream
-# calls the compatibility requirement strict. Bump this in the same commit as the
-# Envoy image; bindgen then regenerates the ABI from that tag's abi.h, so a
-# mismatch is a build error rather than a runtime surprise.
-#
-# NOTE Envoy only WARNS on an ABI version mismatch at load, it does not fail
-# (source/extensions/dynamic_modules/dynamic_modules.cc). So the pin is the only
-# real guard -- see README, "Upgrading Envoy".
+# PINNED TO THE ENVOY THIS RUNS IN. Bump it in the same commit as the Envoy
+# image; bindgen regenerates the ABI from that tag, so a mismatch is a build
+# error. Envoy only WARNS on a runtime ABI mismatch, so this pin is the guard.
 envoy-proxy-dynamic-modules-rust-sdk = { git = "https://github.com/envoyproxy/envoy", tag = "v1.39.1" }
 sha2 = { version = "0.10", features = ["asm"] }
 
 [lib]
-# Produces libaws_ppv2_identity.so. CI renames it to libaws-ppv2-identity.so,
-# because Envoy loads lib<name>.so and Envoy Gateway's module-name pattern
-# (^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$) forbids the underscore Rust insists on.
+# Built as libaws_ppv2_identity.so, renamed to libaws-ppv2-identity.so: Envoy
+# loads lib<name>.so and EG's module-name pattern forbids Rust's underscore.
 name = "aws_ppv2_identity"
 crate-type = ["cdylib", "rlib"]
 
+# Tuned for runtime, not size. These three are already the maximum the profile
+# knobs offer.
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-strip = true
-# MUST stay "unwind". The SDK wraps every FFI entry point in catch_unwind, which
-# is what turns a parser bug into a logged panic instead of a dead Envoy worker.
+
+# LTO inlines our functions into the exported hooks, so they exist as no symbol
+# at all -- DWARF is the only thing that can attribute a profile back to them.
+# Costs nothing at runtime: debug info is never mapped.
+strip = false
+debug = 1   # line tables only
+
+# MUST stay "unwind": the SDK's catch_unwind cannot run under "abort", and one
+# bad header would kill the whole Envoy process instead of one connection.
 panic = "unwind"
+
+# Dependencies carry no debug info: 24MB with, 5MB without, and nobody profiles
+# into sha2 looking for our regressions.
+[profile.release.package."*"]
+debug = 0

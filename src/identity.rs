@@ -1,54 +1,27 @@
 //! Turning a PROXY protocol header into an IPv6 address that policy can match.
 //!
-//! The idea: stop trying to pass tenant identity as a string, and synthesize an
-//! address from it instead. Every policy engine in this stack already matches on
-//! addresses -- Envoy network RBAC on a TCPRoute, HTTP RBAC on an HTTPRoute, and
-//! CiliumNetworkPolicy -- but none of them can match a vpce-id.
+//! Policy engines here match addresses, not vpce-ids, so identity is synthesized
+//! into one. Derived rather than mapped: adding a tenant is a policy rule and no
+//! data-plane change.
 //!
 //! ```text
 //! fd2a:5c1b:7e90 : 0001 : e3b1:45a8:c041:e80a
 //! └── /48 ULA ──┘  └kind┘  └── 64-bit body ──┘
-//!     yours, once     1 = sha256(vpce-id) truncated
-//!                     4 = 4via6, client IPv4 in the low 32 bits
+//!                    1 = sha256(vpce-id) truncated
+//!                    4 = 4via6, client IPv4 in the low 32 bits
 //! ```
 //!
-//! Derived, not mapped, so nothing has to be configured per tenant: adding a
-//! tenant is one policy rule and no data-plane change. Reproduce a value with
+//! Reproduce a value: `printf %s vpce-… | sha256sum | cut -c1-16`. 64 bits is
+//! ample -- AWS generates the ids so nobody can grind a collision, and at 10,000
+//! tenants the birthday probability is ~10^-11.
 //!
-//! ```text
-//! printf %s vpce-028ff61de1d1fea8c | sha256sum | cut -c1-16
-//! ```
+//! The address is a label, not a route: nothing is ever sent from it, so there is
+//! no spoofing concern and no return path.
 //!
-//! 64 bits is ample. Collisions are accidental-only -- AWS generates the ids, so
-//! nobody can grind for one -- and at 10,000 tenants the birthday probability is
-//! around 10^-11.
-//!
-//! THE ADDRESS IS A LABEL, NOT A ROUTE. Nothing is ever sent from it, so there
-//! is no spoofing concern, no return path, and nothing for Cilium's source-IP
-//! verification to reject. It only has to survive as a declared value.
-//!
-//! A REAL IPv6 CLIENT IS PASSED THROUGH UNCHANGED, not encoded. Encoding exists
-//! to give an identity that is not an address one (the vpce-id), and to lift
-//! IPv4 into the v6 space so a single clientCIDRs list covers both. A v6 client
-//! already is a v6 address, so synthesizing could only lose information -- and
-//! stuffing 32 of its 128 bits into the kind-4 body used to collide with real
-//! IPv4 rules, because global unicast 2000::/3 lands in 32.0.0.0-63.255.255.255
-//! when read as IPv4. So for that path this filter just does what Envoy's own
-//! proxy_protocol filter does: adopt the address the header declares.
-//!
-//! Everything this module synthesizes is therefore inside the ULA /48, and
-//! anything outside it is a real client address.
-//!
-//! Two coarse rules fall out for free, which is what the kind nibble buys:
-//! ```text
-//! fd2a:5c1b:7e90:1::/64   any PrivateLink tenant
-//! fd2a:5c1b:7e90:4::/64   any IPv4 internet client
-//! ```
-//! and an IPv4 CIDR /N maps mechanically onto /(96+N) -- unconditionally, now
-//! that nothing else shares the kind-4 body.
-//!
-//! IPv6 clients need no coarse rule: they keep their real addresses, so write
-//! ordinary CIDRs for them (2a05:d014:10da:7800::/56).
+//! Everything synthesized here is inside the ULA /48 and everything outside it is
+//! a real client address. That buys two coarse rules -- `<ula>:1::/64` for any
+//! tenant, `<ula>:4::/64` for any IPv4 client -- and lets an IPv4 /N map onto
+//! /(96+N). IPv6 clients keep their real addresses, so write ordinary CIDRs.
 
 use crate::ppv2;
 use sha2::{Digest, Sha256};
@@ -74,30 +47,23 @@ pub fn synthesize(prefix: Prefix, h: &ppv2::Header) -> [u8; 16] {
         return out;
     }
 
-    // 2. A real IPv6 client already is one. Passing it through keeps all 128
-    //    bits and keeps kind 4 purely IPv4, which is what makes /(96+N) safe --
-    //    see the cross-family collision in the module comment.
+    // 2. A real IPv6 client already is one. Keeps kind 4 purely IPv4, which is
+    //    what makes /(96+N) safe: 2000::/3 reads as IPv4 32-63.x and used to
+    //    collide with real IPv4 rules.
     if h.is_v6 {
         return h.src;
     }
 
-    // 3. IPv4, lifted into the v6 space so one clientCIDRs list covers both.
-    //    The address goes in the low 32 bits, so a v4 /N becomes a v6 /(96+N).
-    //
-    //    Always a real address now: the parser rejects AF_UNSPEC and the LOCAL
-    //    command, so the bare `<ula>:4::` label is no longer reachable.
+    // 3. IPv4 in the low 32 bits, so a v4 /N becomes a v6 /(96+N).
     out[6..8].copy_from_slice(&KIND_VIA4.to_be_bytes());
     out[12..16].copy_from_slice(&h.src[..4]);
     out
 }
 
-/// Text form for the ABI's set_remote_address, written into a stack buffer.
+/// Text form for set_remote_address, in a stack buffer.
 ///
-/// `Ipv6Addr::to_string()` is correct and canonical but costs a heap allocation
-/// plus fmt machinery -- measured at ~160ns, more than everything else in this
-/// filter put together. This keeps std's formatter (so the output is still
-/// canonical RFC 5952, unlike the Zig version's hand-rolled group writer) and
-/// only removes the allocation. 46 bytes is the longest possible IPv6 text form.
+/// Keeps std's formatter so the output stays canonical RFC 5952, but drops the
+/// heap allocation `to_string()` would cost. 46 bytes is the longest IPv6 form.
 pub struct AddrText {
     buf: [u8; 46],
     len: usize,

@@ -2,9 +2,7 @@
 # inside the Envoy process at dlopen time. Linux shared objects allow undefined
 # symbols; macOS does not, so a host build needs dynamic_lookup.
 #
-# Only needed to build and test on a Mac. The deployable artifact targets
-# aarch64-unknown-linux-gnu, where this is unnecessary -- which is why the Zig
-# build never hit it: it cross-compiles to Linux by default.
+# Only needed to build and test on a Mac; the deployable artifact targets Linux.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 

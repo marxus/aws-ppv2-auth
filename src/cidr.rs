@@ -1,14 +1,11 @@
 //! IPv6 CIDR allowlist sized for SecurityPolicy-scale rule counts.
 //!
-//! Envoy's RBAC uses an LC-trie for clientCIDRs. This does the equivalent with
-//! merged disjoint ranges plus a binary search, which is simpler and is enough
-//! because an allowlist only needs "is this address inside ANY range", not
-//! longest-prefix-wins. Overlaps are collapsed at config time, so lookup is
-//! O(log n) with no tree to walk and no per-lookup allocation.
+//! Merged disjoint ranges plus a binary search, which is enough because an
+//! allowlist needs "inside ANY range", not longest-prefix-wins. Overlaps collapse
+//! at config time, so lookup is O(log n) with no allocation.
 //!
-//! Ranges are stored as (start, end) pairs in one Vec rather than two parallel
-//! Vecs: the binary search reads `start` and then the matching `end`, so keeping
-//! them adjacent costs one cache line instead of two.
+//! (start, end) adjacent in one Vec rather than two parallel Vecs: splitting them
+//! measured no faster, and the final bounds check then costs a second cache line.
 
 use std::net::Ipv6Addr;
 
@@ -21,27 +18,17 @@ struct Range {
 #[derive(Debug, Default)]
 pub struct Set {
     ranges: Vec<Range>,
-    /// The first start and the last end, so one compare can reject anything
-    /// outside the whole set. Empty set leaves this as (MAX, 0), which no
-    /// address satisfies -- the deny-everything state stays deny-everything.
+    /// First start and last end. Empty set is (MAX, 0), which nothing satisfies.
     span: (u128, u128),
 }
 
 impl Set {
-    /// Find the last range whose start <= addr, then one bounds check. Ranges
-    /// are disjoint and sorted, so at most one can contain addr.
-    ///
-    /// `partition_point` rather than a hand-rolled loop: std emits a branchless
-    /// search, which measured 20.2 -> 13.1 ns over 10,000 entries with rotating
-    /// keys. A hand-written binary search reads as something to verify; this
-    /// reads as what it means.
+    /// Last range whose start <= addr, then one bounds check. Ranges are disjoint
+    /// and sorted, so at most one can contain addr. `partition_point` emits a
+    /// branchless search: 20.2 -> 13.1 ns over 10,000 entries.
     pub fn contains(&self, addr: u128) -> bool {
-        // Outside the span, no range can contain it, so skip the search: O(1)
-        // instead of O(log n). This is the DENY path, which is the one an
-        // attacker controls the volume of, and an allowlist normally sits
-        // entirely inside one ULA /48 -- so every real internet address lands
-        // here. Measured 19.0 -> 0.3 ns, and it costs one predictable compare
-        // on the allow path.
+        // O(1) instead of O(log n) on the deny path -- the one an attacker
+        // controls the volume of. Measured 19.0 -> 0.3 ns.
         if addr < self.span.0 || addr > self.span.1 {
             return false;
         }
@@ -68,7 +55,7 @@ fn parse_cidr(text: &str) -> Result<Range, &'static str> {
     }
 
     let base = u128::from_be_bytes(ip.octets());
-    // Shifting a u128 by 128 is undefined; handle the /0 edge explicitly.
+    // Shifting a u128 by 128 is undefined, so handle /0 explicitly.
     let mask: u128 = if bits == 0 {
         0
     } else {
@@ -85,12 +72,8 @@ pub fn build(list: &str) -> Result<Set, &'static str> {
     build_from(std::iter::once(list))
 }
 
-/// The same, from one string per `allow` line.
-///
-/// Exists so config::parse can hand over its lines directly instead of joining
-/// them into a comma-separated String for this function to split apart again --
-/// the cost was irrelevant at config time, but text -> text -> parse is a
-/// confusing shape to find in the middle of an allowlist.
+/// The same, from one string per `allow` line, so config::parse can hand its
+/// lines over instead of joining them into a String for this to split again.
 pub fn build_from<'a>(lists: impl Iterator<Item = &'a str>) -> Result<Set, &'static str> {
     let mut raw: Vec<Range> = Vec::new();
     for list in lists {
@@ -103,9 +86,8 @@ pub fn build_from<'a>(lists: impl Iterator<Item = &'a str>) -> Result<Set, &'sta
     }
     raw.sort_unstable_by_key(|r| r.start);
 
-    // Collapse overlapping ranges so lookup is a single bounds check. Adjacent
-    // but non-overlapping ranges are deliberately NOT merged -- it would save
-    // one entry and cost a `+ 1` that can overflow at u128::MAX.
+    // Overlapping ranges collapse. Adjacent-but-not-overlapping ones deliberately
+    // do not: it would save one entry and cost a `+ 1` that overflows at u128::MAX.
     let mut ranges: Vec<Range> = Vec::with_capacity(raw.len());
     for r in raw {
         match ranges.last_mut() {
@@ -117,8 +99,7 @@ pub fn build_from<'a>(lists: impl Iterator<Item = &'a str>) -> Result<Set, &'sta
             _ => ranges.push(r),
         }
     }
-    // (MAX, 0) for an empty set: every address is both below the low bound and
-    // above the high one, so `contains` short-circuits to false.
+    // (MAX, 0) for an empty set, so `contains` short-circuits to false.
     let span = match (ranges.first(), ranges.last()) {
         (Some(f), Some(l)) => (f.start, l.end),
         _ => (u128::MAX, 0),

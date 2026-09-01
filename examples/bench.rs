@@ -1,6 +1,5 @@
-//! Pure-logic benchmark, matched op-for-op with the Zig module's _bench and the
-//! Go port, so the three numbers are comparable. Same 112-byte PrivateLink
-//! header, same 10,000-entry allowlist, same worst-case lookup (last entry).
+//! Pure-logic benchmark: 112-byte PrivateLink header, 10,000-entry allowlist,
+//! worst-case lookup (last entry).
 use aws_ppv2_identity::{cidr, identity, ppv2 as pp};
 use std::time::Instant;
 
@@ -30,7 +29,7 @@ fn pl_header() -> Vec<u8> {
 }
 
 fn bench(name: &str, iters: u64, mut f: impl FnMut(u64) -> u64) {
-    // best of 3, matching the Zig harness and `go test -count=3`
+    // best of 3
     let mut best = u64::MAX;
     let mut sink = 0u64;
     for _ in 0..3 {
@@ -96,9 +95,8 @@ fn main() {
         }
         s
     });
-    // The deny path, which is the one an attacker controls the volume of. A real
-    // internet address sits outside the allowlist's span, so this measures the
-    // short circuit rather than the search.
+    // Deny path: a real internet address sits outside the allowlist's span, so
+    // this measures the short circuit rather than the search.
     let outside = identity::to_u128(
         "2a05:d014:10da:7800::1"
             .parse::<std::net::Ipv6Addr>()
