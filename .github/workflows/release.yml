@@ -1,9 +1,15 @@
+# Publishes ONE artifact: the multi-arch image. There was also a job emitting
+# the bare .so per architecture as release assets, for a consumer that would
+# rather use dynamicModules' source.remote than mount an image. No such consumer
+# exists, and it meant building the same .so six times per tag -- twice here,
+# twice in the image, twice already in ci. Bring it back the day someone needs
+# a URL instead of a manifest list.
 name: release
 on:
   push:
     tags: ["v*"]
 permissions:
-  contents: write   # create the release
+  contents: read
   packages: write   # push to ghcr
 
 jobs:
@@ -35,28 +41,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: true
           sbom: true
-
-  # Also publish the bare .so per architecture, for anyone who would rather use
-  # dynamicModules' source.remote (url + sha256) than mount an image.
-  assets:
-    runs-on: ubuntu-latest
-    container: ghcr.io/rust-cross/cargo-zigbuild:0.23.3   # see ci.yml
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-unknown-linux-gnu
-            asset: libaws-ppv2-identity-aarch64.so
-          - target: x86_64-unknown-linux-gnu
-            asset: libaws-ppv2-identity-x86_64.so
-    steps:
-      - uses: actions/checkout@v4
-      - run: apt-get update && apt-get install -y clang
-      - run: cargo zigbuild --release --target ${{ matrix.target }}
-      - run: |
-          cp target/${{ matrix.target }}/release/libaws_ppv2_identity.so ${{ matrix.asset }}
-          sha256sum ${{ matrix.asset }} | tee ${{ matrix.asset }}.sha256
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ${{ matrix.asset }}
-            ${{ matrix.asset }}.sha256
