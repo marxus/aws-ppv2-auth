@@ -9,7 +9,9 @@
 # manifest list by itself -- the main advantage over publishing a .so to a
 # release and pointing dynamicModules' source.remote at a URL, which pins one
 # architecture into the YAML.
-FROM --platform=$BUILDPLATFORM ghcr.io/rust-cross/cargo-zigbuild:0.19.8 AS build
+# 0.19.8 shipped a Rust older than 1.85, where the SDK's set_factory_once macro
+# fails on the then-unstable ptr::fn_addr_eq. Keep this pin current.
+FROM --platform=$BUILDPLATFORM ghcr.io/rust-cross/cargo-zigbuild:0.23.3 AS build
 # bindgen needs libclang to parse Envoy's abi.h.
 RUN apt-get update && apt-get install -y --no-install-recommends clang && rm -rf /var/lib/apt/lists/*
 WORKDIR /build

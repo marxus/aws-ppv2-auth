@@ -23,17 +23,18 @@ jobs:
   # than finding out at release time.
   cross:
     runs-on: ubuntu-latest
+    # Build in the exact image the Dockerfile builds with, so CI cannot drift
+    # from what ships. It already carries zig, cargo-zigbuild and both target
+    # std libs, which also removes the dependency on zig's download mirrors --
+    # setup-zig@v1 resolving "latest" is what broke the first release.
+    container: ghcr.io/rust-cross/cargo-zigbuild:0.23.3
     strategy:
       matrix:
         target: [aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { targets: "${{ matrix.target }}" }
-      - uses: mlugg/setup-zig@v1
-      - run: sudo apt-get update && sudo apt-get install -y clang
+      - run: apt-get update && apt-get install -y clang
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-zigbuild --locked
       - run: cargo zigbuild --release --target ${{ matrix.target }}
       - name: exported hooks are present
         run: |

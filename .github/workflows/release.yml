@@ -40,6 +40,7 @@ jobs:
   # dynamicModules' source.remote (url + sha256) than mount an image.
   assets:
     runs-on: ubuntu-latest
+    container: ghcr.io/rust-cross/cargo-zigbuild:0.23.3   # see ci.yml
     strategy:
       matrix:
         include:
@@ -49,11 +50,7 @@ jobs:
             asset: libaws-ppv2-x86_64.so
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { targets: "${{ matrix.target }}" }
-      - uses: mlugg/setup-zig@v1
-      - run: sudo apt-get update && sudo apt-get install -y clang
-      - run: cargo install cargo-zigbuild --locked
+      - run: apt-get update && apt-get install -y clang
       - run: cargo zigbuild --release --target ${{ matrix.target }}
       - run: |
           cp target/${{ matrix.target }}/release/libaws_ppv2.so ${{ matrix.asset }}
