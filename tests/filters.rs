@@ -1,0 +1,194 @@
+//! The two filters, against the SDK's mock Envoy.
+//!
+//! These are the files that actually decide whether traffic is admitted, and
+//! they had no tests: every case here is an enforcement path, not a parse.
+
+mod common;
+
+use aws_ppv2_identity::{config, tcp, udp};
+use common::{build, V2_PROXY};
+use envoy_proxy_dynamic_modules_rust_sdk::*;
+use std::sync::Arc;
+
+use abi::envoy_dynamic_module_type_on_listener_filter_status as TcpStatus;
+use abi::envoy_dynamic_module_type_on_udp_listener_filter_status as UdpStatus;
+
+const ULA: &str = "ula fd2a:5c1b:7e90::/48\n";
+/// sha256("vpce-028ff61de1d1fea8c")[..8] -- see tests/identity.rs.
+const TENANT: &str = "allow fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128\n";
+
+fn tcp_config(text: &str) -> tcp::FilterConfig {
+    tcp::FilterConfig {
+        cfg: Arc::new(config::parse(text).unwrap()),
+    }
+}
+
+fn udp_config(text: &str) -> udp::FilterConfig {
+    udp::FilterConfig {
+        cfg: Arc::new(config::parse(text).unwrap()),
+    }
+}
+
+/// Leaks so the mock can hand back an EnvoyBuffer borrowed from `&self`.
+fn leak(v: Vec<u8>) -> &'static [u8] {
+    Box::leak(v.into_boxed_slice())
+}
+
+// --- TCP -------------------------------------------------------------------
+
+#[test]
+fn a_refused_connection_is_not_admitted_by_a_later_on_data() {
+    // REGRESSION. StopIteration means "wait for more data", not "reject", so
+    // Envoy calls on_data again as bytes arrive. The filter used to mark itself
+    // done on the refusal path, and the done-guard returned Continue on that
+    // second call -- admitting a connection with require_ppv2 on. Reproduced
+    // exactly: a short non-PPv2 prefix, then more bytes.
+    let fc = tcp_config(ULA);
+    let mut envoy = MockEnvoyListenerFilter::new();
+    envoy
+        .expect_get_buffer_chunk()
+        .returning(|| Some(EnvoyBuffer::new(b"GET ")));
+    // The actual reject mechanism, and it must fire exactly once.
+    envoy
+        .expect_continue_filter_chain()
+        .withf(|success| !success)
+        .times(1)
+        .returning(|_| ());
+
+    let mut f = fc.new_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy, 4), TcpStatus::StopIteration);
+    // The second call is the bug. It must not admit.
+    assert_eq!(f.on_data(&mut envoy, 16), TcpStatus::StopIteration);
+    assert_eq!(f.on_data(&mut envoy, 64), TcpStatus::StopIteration);
+}
+
+#[test]
+fn require_ppv2_false_still_passes_non_ppv2_through() {
+    let fc = tcp_config("ula fd2a:5c1b:7e90::/48\nrequire_ppv2 false\n");
+    let mut envoy = MockEnvoyListenerFilter::new();
+    envoy
+        .expect_get_buffer_chunk()
+        .returning(|| Some(EnvoyBuffer::new(b"GET / HTTP/1.1\r\n\r\n")));
+    envoy.expect_continue_filter_chain().never();
+
+    let mut f = fc.new_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy, 18), TcpStatus::Continue);
+}
+
+#[test]
+fn a_tenant_header_is_labelled_with_the_synthesized_address_and_drained() {
+    let hdr = leak(build(
+        V2_PROXY,
+        0x11,
+        &[10, 0, 1, 28],
+        Some(b"vpce-028ff61de1d1fea8c"),
+    ));
+    let fc = tcp_config(ULA);
+    let mut envoy = MockEnvoyListenerFilter::new();
+    envoy
+        .expect_get_buffer_chunk()
+        .returning(move || Some(EnvoyBuffer::new(hdr)));
+    envoy
+        .expect_set_remote_address()
+        .withf(|addr, _port, is_ipv6| addr == "fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a" && *is_ipv6)
+        .times(1)
+        .returning(|_, _, _| true);
+    // The whole header is stripped, so the backend sees only its own protocol.
+    envoy
+        .expect_drain_buffer()
+        .withf(move |len| *len == hdr.len())
+        .times(1)
+        .returning(|_| ());
+
+    let mut f = fc.new_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy, hdr.len()), TcpStatus::Continue);
+}
+
+#[test]
+fn a_partial_header_asks_for_the_total_not_the_remainder() {
+    // Envoy peeks with MSG_PEEK and never consumes, so max_read_bytes is
+    // counted from the first byte of the connection.
+    let full = build(V2_PROXY, 0x11, &[10, 0, 1, 28], Some(b"vpce-abc"));
+    let total = full.len();
+    let head = leak(full[..16].to_vec());
+
+    let fc = tcp_config(ULA);
+    let mut envoy = MockEnvoyListenerFilter::new();
+    envoy
+        .expect_get_buffer_chunk()
+        .returning(move || Some(EnvoyBuffer::new(head)));
+
+    let mut f = fc.new_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy, 16), TcpStatus::StopIteration);
+    assert_eq!(f.max_read_bytes(&mut envoy), total);
+}
+
+// --- UDP -------------------------------------------------------------------
+
+#[test]
+fn a_datagram_outside_the_allowlist_is_dropped() {
+    let dg = leak(build(
+        V2_PROXY,
+        0x12,
+        &[10, 0, 1, 28],
+        Some(b"vpce-somebody-else"),
+    ));
+    let fc = udp_config(&format!("{ULA}{TENANT}"));
+    let mut envoy = MockEnvoyUdpListenerFilter::new();
+    envoy
+        .expect_get_datagram_data()
+        .returning(move || (vec![EnvoyBuffer::new(dg)], dg.len()));
+    envoy.expect_set_datagram_data().never();
+
+    let mut f = fc.new_udp_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
+}
+
+#[test]
+fn an_allowed_datagram_is_stripped_and_forwarded() {
+    let payload = b"\x12\x34hello dns";
+    let mut dg_vec = build(
+        V2_PROXY,
+        0x12,
+        &[10, 0, 1, 28],
+        Some(b"vpce-028ff61de1d1fea8c"),
+    );
+    let hdr_len = dg_vec.len();
+    dg_vec.extend_from_slice(payload);
+    let dg = leak(dg_vec);
+
+    let fc = udp_config(&format!("{ULA}{TENANT}"));
+    let mut envoy = MockEnvoyUdpListenerFilter::new();
+    envoy
+        .expect_get_datagram_data()
+        .returning(move || (vec![EnvoyBuffer::new(dg)], dg.len()));
+    // Only the payload survives -- the PPv2 header is not forwarded.
+    envoy
+        .expect_set_datagram_data()
+        .withf(move |data| data == &dg[hdr_len..])
+        .times(1)
+        .returning(|_| true);
+
+    let mut f = fc.new_udp_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy), UdpStatus::Continue);
+}
+
+#[test]
+fn an_empty_allowlist_denies_a_well_formed_tenant() {
+    // Security-group semantics all the way through the filter, not just the set.
+    let dg = leak(build(
+        V2_PROXY,
+        0x12,
+        &[10, 0, 1, 28],
+        Some(b"vpce-028ff61de1d1fea8c"),
+    ));
+    let fc = udp_config(ULA);
+    let mut envoy = MockEnvoyUdpListenerFilter::new();
+    envoy
+        .expect_get_datagram_data()
+        .returning(move || (vec![EnvoyBuffer::new(dg)], dg.len()));
+    envoy.expect_set_datagram_data().never();
+
+    let mut f = fc.new_udp_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
+}

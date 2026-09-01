@@ -132,7 +132,12 @@ pub fn parse(buf: &[u8]) -> Result<Header<'_>, Error> {
             break;
         }
         if body[i] == TLV_AWS && tl > 1 && body[i + 3] == AWS_SUBTYPE_VPCE_ID {
+            // First wins, and stop. Nothing after this is read, and leaving it
+            // as last-wins meant a duplicate 0xEA decided the identity -- an
+            // ambiguity worth pinning down even though forging a second TLV
+            // requires the same access as forging the first.
             vpce = &body[i + 4..end];
+            break;
         }
         i = end;
     }

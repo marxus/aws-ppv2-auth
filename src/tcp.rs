@@ -25,16 +25,23 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for FilterConfig {
             cfg: self.cfg.clone(),
             want: 16,
             done: false,
+            refused: false,
         })
     }
 }
 
 pub struct Filter {
     cfg: Arc<config::Config>,
-    /// Envoy calls on_data repeatedly as bytes arrive; `want` asks for exactly
-    /// the number still needed.
+    /// Envoy calls on_data repeatedly as bytes arrive. This is the TOTAL header
+    /// size wanted, counted from the first byte of the connection -- not the
+    /// remainder. Envoy peeks with MSG_PEEK and never consumes, so a delta would
+    /// re-request bytes it already has.
     want: usize,
+    /// Terminal states, and they are not symmetric. `done` admits, `refused`
+    /// rejects, and a filter that has refused must never later admit -- see
+    /// on_data.
     done: bool,
+    refused: bool,
 }
 
 /// What one on_data pass decided to do.
@@ -71,6 +78,16 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Filter {
     ) -> abi::envoy_dynamic_module_type_on_listener_filter_status {
         use abi::envoy_dynamic_module_type_on_listener_filter_status as Status;
 
+        // Order matters: refusal wins. StopIteration means "wait for more data",
+        // NOT "reject" -- Envoy keeps this filter at the head of the chain and
+        // calls on_data again as bytes arrive (active_tcp_socket.cc). So a
+        // refusal that only returned StopIteration was admitted on the next
+        // call: send a short non-PPv2 prefix, then more bytes, and the
+        // connection went through with require_ppv2 on. Rejecting means calling
+        // continue_filter_chain(false), which closes the socket.
+        if self.refused {
+            return Status::StopIteration;
+        }
         if self.done {
             return Status::Continue;
         }
@@ -98,17 +115,26 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Filter {
             }
             // Pass through or refuse, but never label it.
             Decision::NotProxyProtocol => {
-                self.done = true;
                 if self.cfg.require_ppv2 {
+                    self.refused = true;
+                    envoy.continue_filter_chain(false);
                     Status::StopIteration
                 } else {
+                    self.done = true;
                     Status::Continue
                 }
             }
             Decision::Label { addr, port, len } => {
                 // is_ipv6 is always true: a synthesized address is a ULA, and a
                 // passed-through one is a real v6 address.
+                //
+                // A failure here cannot be retried: the buffer already holds the
+                // whole header, so returning StopIteration would ask Envoy for
+                // bytes it will never read -- a stall, and an ASSERT trip in a
+                // debug Envoy. Refuse instead of hanging.
                 if !envoy.set_remote_address(addr.as_str(), port, true) {
+                    self.refused = true;
+                    envoy.continue_filter_chain(false);
                     return Status::StopIteration;
                 }
                 // Strip the header so the backend sees only its own protocol.

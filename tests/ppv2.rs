@@ -1,34 +1,9 @@
 //! Wire-format tests for the PROXY protocol v2 parser.
-//!
-//! `0x21` is written literally rather than imported. What is under test is the
-//! byte on the wire, so asserting against a constant the parser also uses would
-//! only prove it agrees with itself.
 
-use aws_ppv2_identity::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
+mod common;
 
-/// Version 2 + PROXY. The only 13th byte an NLB ever sends.
-const V2_PROXY: u8 = 0x21;
-
-/// `fam` is the whole 13th byte, so tests can express UDP and bad families.
-fn build(ver_cmd: u8, fam: u8, src: &[u8], vpce: Option<&[u8]>) -> Vec<u8> {
-    let addr_len = if fam >> 4 == 0x2 { 36 } else { 12 };
-    let mut body = vec![0u8; addr_len];
-    let n = src.len().min(addr_len);
-    body[..n].copy_from_slice(&src[..n]);
-    if let Some(v) = vpce {
-        body.push(TLV_AWS);
-        body.extend_from_slice(&((1 + v.len()) as u16).to_be_bytes());
-        body.push(AWS_SUBTYPE_VPCE_ID);
-        body.extend_from_slice(v);
-    }
-    let mut out = Vec::new();
-    out.extend_from_slice(&SIGNATURE);
-    out.push(ver_cmd);
-    out.push(fam);
-    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-    out.extend_from_slice(&body);
-    out
-}
+use aws_ppv2_identity::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, TLV_AWS};
+use common::{build, V2_PROXY};
 
 #[test]
 fn privatelink_datagram_header_yields_the_vpce_id() {
@@ -134,4 +109,25 @@ fn a_tlv_claiming_more_than_is_present_does_not_panic() {
     let n = (evil.len() - 16) as u16;
     evil[14..16].copy_from_slice(&n.to_be_bytes());
     assert!(ppv2::parse(&evil).unwrap().vpce.is_empty());
+}
+
+#[test]
+fn a_duplicate_aws_tlv_does_not_get_to_pick_the_identity() {
+    // The walk used to keep assigning, so the LAST 0xEA won. Forging a second
+    // TLV needs the same access as forging the first, so this is not an
+    // escalation -- but "which one counts" should not be an open question in
+    // the thing that decides tenant identity.
+    let mut buf = build(V2_PROXY, 0x11, &[1, 2, 3, 4], Some(b"vpce-first"));
+    let extra = [
+        &[TLV_AWS][..],
+        &(1 + 11u16).to_be_bytes()[..],
+        &[AWS_SUBTYPE_VPCE_ID][..],
+        b"vpce-second",
+    ]
+    .concat();
+    buf.extend_from_slice(&extra);
+    let n = (buf.len() - 16) as u16;
+    buf[14..16].copy_from_slice(&n.to_be_bytes());
+
+    assert_eq!(ppv2::parse(&buf).unwrap().vpce, b"vpce-first");
 }

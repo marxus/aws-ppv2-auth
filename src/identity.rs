@@ -153,6 +153,12 @@ pub fn parse_prefix(text: &str) -> Result<Prefix, &'static str> {
     if o[0] & 0xfe != 0xfc {
         return Err("not unique-local");
     }
+    // Only the first 6 bytes are kept, so anything set below /48 would be
+    // silently discarded -- and a `ula` that does not mean what it says is the
+    // one config error that produces addresses nobody's rules match.
+    if o[6..].iter().any(|&b| b != 0) {
+        return Err("prefix has bits set below /48");
+    }
     let mut p = [0u8; 6];
     p.copy_from_slice(&o[..6]);
     Ok(p)

@@ -102,12 +102,16 @@ one-per-line is readable and a comma soup is not:
 ula   fd2a:5c1b:7e90::/48
 allow fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128
 allow 2a05:d014:10da:7800::/56
-# require_ppv2 false   -- let unlabelled traffic through instead of dropping
+# require_ppv2 false   -- pass unlabelled traffic instead of dropping it.
+#                         Rejected alongside `allow`; see below.
 ```
 
-Generate your own `ula` once, per RFC 4193: `fd` plus 40 random bits. Unknown
-keys are an error rather than ignored, so a typo fails the config instead of
-silently disabling enforcement.
+Generate your own `ula` once, per RFC 4193: `fd` plus 40 random bits, and with
+nothing set below the /48 — a `ula` carrying lower bits is rejected rather than
+silently truncated to six bytes. Unknown keys are an error rather than ignored,
+so a typo fails the config instead of silently disabling enforcement, and
+`require_ppv2` takes only `true` or `false` — `require_ppv2 no` is an error, not
+a quiet `true`.
 
 **`allow` is consulted only by the UDP filter**, and it is **allowlist-only, like
 a security group**: an address is permitted iff some `allow` line covers it, so an
@@ -115,11 +119,16 @@ empty list denies everything. That is why there is no `enforce` flag — one der
 from "is the list non-empty" would make the single safe state mean allow-any.
 
 On the TCP path, leave `allow` unset: `set_remote_address` makes the synthesized
-address the connection's own and a `SecurityPolicy` does the matching.
+address the connection's own and a `SecurityPolicy` does the matching. A TCP
+config carrying `allow` is **rejected**, because the TCP filter has no
+enforcement point — a security rule that reads as applied and does nothing is
+worse than one that fails loudly.
 
-One interaction to keep in mind: `require_ppv2 false` returns `Continue` *before*
-the allowlist is consulted, because an unparsed header yields no address to match.
-On UDP that makes it an allowlist bypass for headerless traffic.
+`require_ppv2 false` returns `Continue` *before* the allowlist is consulted,
+because an unparsed header yields no address to match — on UDP that is an
+allowlist bypass for headerless traffic. So the two are **rejected together**:
+`require_ppv2 false` with a non-empty `allow` fails the config. Either alone is
+fine. This used to be a documented footgun; it is now unrepresentable.
 
 ## Why the two filters differ
 
