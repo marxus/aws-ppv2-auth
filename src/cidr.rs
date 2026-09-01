@@ -1,11 +1,8 @@
-//! IPv6 CIDR allowlist sized for SecurityPolicy-scale rule counts.
+//! IPv6 CIDR allowlist. Merged disjoint ranges plus a binary search, which is
+//! enough because an allowlist needs "inside ANY range", not longest-prefix-wins.
 //!
-//! Merged disjoint ranges plus a binary search, which is enough because an
-//! allowlist needs "inside ANY range", not longest-prefix-wins. Overlaps collapse
-//! at config time, so lookup is O(log n) with no allocation.
-//!
-//! (start, end) adjacent in one Vec rather than two parallel Vecs: splitting them
-//! measured no faster, and the final bounds check then costs a second cache line.
+//! (start, end) adjacent rather than two parallel Vecs: splitting them measured
+//! no faster and costs a second cache line on the bounds check.
 
 use std::net::Ipv6Addr;
 
@@ -45,7 +42,7 @@ impl Set {
     }
 }
 
-/// Parses "addr/len" (IPv6 only). Returns the inclusive range it covers.
+/// IPv6 only. Returns the inclusive range the prefix covers.
 fn parse_cidr(text: &str) -> Result<Range, &'static str> {
     let (ip_text, bits_text) = text.split_once('/').ok_or("missing prefix length")?;
     let ip: Ipv6Addr = ip_text.parse().map_err(|_| "bad IPv6 address")?;
@@ -67,7 +64,7 @@ fn parse_cidr(text: &str) -> Result<Range, &'static str> {
     })
 }
 
-/// Builds the set once, at config load. Comma/whitespace separated CIDRs.
+/// Comma/whitespace separated CIDRs.
 pub fn build(list: &str) -> Result<Set, &'static str> {
     build_from(std::iter::once(list))
 }

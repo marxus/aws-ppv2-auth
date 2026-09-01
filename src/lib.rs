@@ -1,14 +1,10 @@
 //! Envoy dynamic module: PROXY protocol v2 identity, for TCP and UDP.
 //!
-//! One shared object, two filters. The parser, the identity synthesis and the
-//! config format are shared; only the last step differs:
+//! One shared object, two filters. Parser, synthesis and config are shared; only
+//! the last step differs:
 //!
 //!   TCP  set_remote_address  -> a SecurityPolicy matches downstream
 //!   UDP  in-filter allowlist -> nothing downstream can read an identity
-//!
-//! bindgen generates the ABI from the pinned Envoy tag, so a mismatch is a build
-//! error. Every entry point is wrapped in catch_unwind by the SDK, which is why
-//! a parser bug drops a connection instead of an Envoy worker.
 
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::sync::Arc;

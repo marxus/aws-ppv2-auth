@@ -29,7 +29,6 @@ fn pl_header() -> Vec<u8> {
 }
 
 fn bench(name: &str, iters: u64, mut f: impl FnMut(u64) -> u64) {
-    // best of 3
     let mut best = u64::MAX;
     let mut sink = 0u64;
     for _ in 0..3 {

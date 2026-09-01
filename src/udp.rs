@@ -8,7 +8,7 @@ use crate::{config, identity, ppv2};
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::sync::Arc;
 
-/// The ABI's status enum, aliased for the same reason as in tcp.rs.
+/// See tcp.rs.
 type Status = abi::envoy_dynamic_module_type_on_udp_listener_filter_status;
 
 pub struct FilterConfig {
@@ -31,13 +31,10 @@ pub struct Filter {
     payload: Vec<u8>,
 }
 
-/// What one on_data pass decided.
 enum Decision {
-    /// Allowlist covers it; stripped payload is staged in `self.payload`.
+    /// Stripped payload is staged in `self.payload`.
     Forward,
-    /// Parsed, but no `allow` rule covers the identity.
     Denied,
-    /// Not PPv2 at all.
     NotProxyProtocol,
 }
 

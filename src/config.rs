@@ -1,4 +1,5 @@
 //! filter_config, shared by both filters. Arrives as an unwrapped StringValue.
+//! See README for the format and the two rejected combinations.
 //!
 //! ```text
 //! ula          fd2a:5c1b:7e90::/48
@@ -6,17 +7,9 @@
 //! require_ppv2 true
 //! ```
 //!
-//! Allowlist only, like a security group: allowed iff some `allow` line covers
-//! it, so an empty list denies everything. That is why there is no `enforce`
-//! flag -- deriving one from "is the list non-empty" would turn the safe state
-//! into allow-any.
-//!
-//! `allow` is UDP-only, and a TCP config carrying it is rejected rather than
-//! silently ignored. `require_ppv2 false` plus a non-empty `allow` is rejected
-//! too: the allowlist is only consulted on a header that parsed.
-//!
-//! filter_config rather than a file, because editing the EnvoyPatchPolicy is an
-//! LDS update and reruns config_new; a ConfigMap would need a pod restart.
+//! Allowlist only: an empty list denies everything, which is why there is no
+//! `enforce` flag -- deriving one from "is the list non-empty" would make the
+//! safe state mean allow-any.
 
 use crate::{cidr, identity};
 

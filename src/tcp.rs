@@ -40,17 +40,14 @@ pub struct Filter {
     refused: bool,
 }
 
-/// What one on_data pass decided to do.
 enum Decision {
-    /// Rewrite the source to this address and drain that many bytes.
     Label {
         addr: identity::AddrText,
         port: u32,
         len: usize,
     },
-    /// Not enough bytes yet; ask Envoy for this many.
+    /// Total bytes wanted, not the remainder.
     Need(usize),
-    /// Not PPv2 at all.
     NotProxyProtocol,
 }
 
@@ -97,7 +94,6 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Filter {
                 self.want = n;
                 Status::StopIteration
             }
-            // Pass through or refuse, but never label it.
             Decision::NotProxyProtocol => {
                 if self.cfg.require_ppv2 {
                     self.refused = true;
@@ -117,7 +113,6 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Filter {
                     envoy.continue_filter_chain(false);
                     return Status::StopIteration;
                 }
-                // Strip the header so the backend sees only its own protocol.
                 envoy.drain_buffer(len);
                 self.done = true;
                 Status::Continue

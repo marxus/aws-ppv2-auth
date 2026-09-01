@@ -1,10 +1,8 @@
-//! PROXY protocol v2, narrowed to what AWS Network Load Balancers actually send.
-//!
-//! Everything an NLB never emits is rejected rather than handled: only the 0x21
-//! command, only AF_INET and AF_INET6. Anything reaching the listener directly
+//! PROXY protocol v2, narrowed to what AWS Network Load Balancers actually send:
+//! only 0x21, only AF_INET and AF_INET6. Anything reaching the listener directly
 //! is hostile input, so every read is bounds-checked.
 //!
-//! Measured header shapes: TCP 84 bytes, UDP 112. TLVs are 0x03 CRC32C, optional
+//! Measured shapes: TCP 84 bytes, UDP 112. TLVs are 0x03 CRC32C, optional
 //! 0xEA AWS/0x01 vpce-id, 0x04 NOOP padding.
 
 pub const SIGNATURE: [u8; 12] = [
@@ -32,9 +30,8 @@ const PORTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Not enough bytes yet. Ask Envoy for this many in total.
+    /// Total bytes needed, not the remainder.
     Need(usize),
-    /// Not a header this module accepts. Never label it.
     Invalid,
 }
 
