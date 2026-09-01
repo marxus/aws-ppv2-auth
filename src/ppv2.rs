@@ -72,6 +72,21 @@ const V2_PROXY: u8 = 0x21;
 /// A TLV is one type byte plus a two-byte length, then that many value bytes.
 const TLV_HEADER: usize = 3;
 
+/// Ceiling on the declared header length.
+///
+/// NOT a tidiness rule -- it is the only thing bounding memory per connection.
+/// `parse` returns `Need(len)` from the declared length, the TCP filter feeds
+/// that to `max_read_bytes`, and Envoy answers with
+/// `make_unique<uint8_t[]>(len)` per connection (listener_filter_buffer_impl.cc
+/// resetCapacity). Uncapped, 16 bytes of attacker input -- signature, 0x21, any
+/// two length bytes -- reserves 65,551 of them and holds it until the listener
+/// filter timeout. That is 4096x amplification for the cost of one small write.
+///
+/// Measured against a live NLB the largest header is 112 bytes (UDP over IPv6);
+/// TCP is 84. 256 leaves room for TLVs AWS might add and still caps the ratio
+/// at 16x.
+const MAX_HEADER: usize = 256;
+
 /// The address block carries a source and destination port after the addresses.
 const PORTS: usize = 4;
 
@@ -115,6 +130,11 @@ pub fn parse(buf: &[u8]) -> Result<Header<'_>, Error> {
     }
 
     let len = PREAMBLE + u16::from_be_bytes([buf[14], buf[15]]) as usize;
+    // Before Need(len), not after: this is what stops a 16-byte write from
+    // reserving 64KB of Envoy's memory. See MAX_HEADER.
+    if len > MAX_HEADER {
+        return Err(Error::Invalid);
+    }
     if buf.len() < len {
         return Err(Error::Need(len));
     }

@@ -2,7 +2,7 @@
 
 mod common;
 
-use aws_ppv2_identity::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, TLV_AWS};
+use aws_ppv2_identity::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
 use common::{build, V2_PROXY};
 
 #[test]
@@ -109,6 +109,32 @@ fn a_tlv_claiming_more_than_is_present_does_not_panic() {
     let n = (evil.len() - 16) as u16;
     evil[14..16].copy_from_slice(&n.to_be_bytes());
     assert!(ppv2::parse(&evil).unwrap().vpce.is_empty());
+}
+
+#[test]
+fn an_oversized_declared_length_is_rejected_not_buffered() {
+    // REGRESSION, and the reason is memory rather than parsing. Need(len) feeds
+    // max_read_bytes, and Envoy allocates that per connection. Uncapped, these
+    // 16 bytes reserved 65,551 of them until the listener filter timeout --
+    // 4096x amplification for one small write.
+    let mut evil = Vec::new();
+    evil.extend_from_slice(&SIGNATURE);
+    evil.push(V2_PROXY);
+    evil.push(0x00); // family the parser rejects -- the length check comes first
+    evil.extend_from_slice(&[0xff, 0xff]);
+    assert_eq!(evil.len(), 16);
+    assert_eq!(ppv2::parse(&evil), Err(Error::Invalid));
+
+    // A header at the ceiling still parses, so the cap cannot silently break a
+    // real one: 112 bytes is the largest an NLB sends.
+    let real = build(
+        V2_PROXY,
+        0x12,
+        &[10, 0, 1, 28],
+        Some(b"vpce-028ff61de1d1fea8c"),
+    );
+    assert!(real.len() < 256);
+    assert!(ppv2::parse(&real).is_ok());
 }
 
 #[test]

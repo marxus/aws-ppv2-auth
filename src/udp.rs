@@ -63,9 +63,6 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
         // costs no allocation at all.
         let decision = {
             let (chunks, total) = envoy.get_datagram_data();
-            if total < ppv2::PREAMBLE {
-                return Status::StopIteration;
-            }
             let joined: Option<Vec<u8>> = if chunks.len() == 1 {
                 None
             } else {
@@ -80,8 +77,13 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
                 None => chunks[0].as_slice(),
             };
 
-            // A datagram is self-contained: no "read more" here, unlike TCP.
+            // A datagram is self-contained: no "read more" here, unlike TCP, so
+            // a short one is simply not PPv2. Routing it through the same arm as
+            // any other parse failure is what makes require_ppv2 govern every
+            // one of them -- it used to be dropped unconditionally, so a 10-byte
+            // datagram and a 20-byte non-PPv2 datagram were treated differently.
             match ppv2::parse(buf) {
+                Err(ppv2::Error::Need(_)) => Decision::NotProxyProtocol,
                 Ok(h) => {
                     let addr = identity::synthesize(self.cfg.prefix, &h);
                     if self.cfg.allow.contains(identity::to_u128(addr)) {

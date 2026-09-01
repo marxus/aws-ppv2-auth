@@ -53,7 +53,7 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
     _name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn ListenerFilterConfig<ELF>>> {
-    let cfg = load(config_bytes, Filter::Tcp)?;
+    let cfg = load(config_bytes, Side::Tcp)?;
     Some(Box::new(tcp::FilterConfig { cfg }))
 }
 
@@ -62,14 +62,17 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
     _name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
-    let cfg = load(config_bytes, Filter::Udp)?;
+    let cfg = load(config_bytes, Side::Udp)?;
     Some(Box::new(udp::FilterConfig { cfg }))
 }
 
 /// Which filter is being configured. Only one rule differs between them, but it
 /// is a rule about what the config is allowed to say, so it belongs here rather
 /// than in `config::parse`.
-enum Filter {
+///
+/// Named `Side`, not `Filter`: `tcp::Filter` and `udp::Filter` are the actual
+/// filters, and two unrelated types called Filter one module apart is a trap.
+enum Side {
     Tcp,
     Udp,
 }
@@ -79,7 +82,7 @@ enum Filter {
 /// Envoy says nothing about why it rejected one, and an ABI mismatch only warns,
 /// so a silent failure here is a module that does not load with no thread to
 /// pull. stderr is the one channel a config hook has, and Envoy captures it.
-fn load(bytes: &[u8], which: Filter) -> Option<Arc<config::Config>> {
+fn load(bytes: &[u8], which: Side) -> Option<Arc<config::Config>> {
     match validate(bytes, which) {
         Ok(cfg) => Some(Arc::new(cfg)),
         Err(e) => {
@@ -91,13 +94,13 @@ fn load(bytes: &[u8], which: Filter) -> Option<Arc<config::Config>> {
 
 /// Fail closed. Do not substitute a default -- an empty allowlist is the
 /// deny-everything state, but a missing `ula` has no safe interpretation.
-fn validate(bytes: &[u8], which: Filter) -> Result<config::Config, &'static str> {
+fn validate(bytes: &[u8], which: Side) -> Result<config::Config, &'static str> {
     let text = std::str::from_utf8(bytes).map_err(|_| "filter_config is not valid UTF-8")?;
     let cfg = config::parse(text)?;
     // The TCP filter has no enforcement point -- it labels, and a SecurityPolicy
     // matches downstream. An `allow` line here would be a security rule that
     // reads as applied and does nothing.
-    if matches!(which, Filter::Tcp) && !cfg.allow.is_empty() {
+    if matches!(which, Side::Tcp) && !cfg.allow.is_empty() {
         return Err("`allow` is UDP-only; match the synthesized address in a SecurityPolicy");
     }
     Ok(cfg)

@@ -174,6 +174,31 @@ fn an_allowed_datagram_is_stripped_and_forwarded() {
 }
 
 #[test]
+fn a_short_datagram_obeys_require_ppv2_like_every_other_parse_failure() {
+    // It used to be dropped unconditionally, so with require_ppv2 off a 10-byte
+    // datagram died while a 20-byte non-PPv2 one passed. Same input, both flags.
+    let runt: &'static [u8] = b"\x0d\x0a\x0d\x0a\x00\x0d";
+
+    let strict = udp_config(ULA);
+    let mut envoy = MockEnvoyUdpListenerFilter::new();
+    envoy
+        .expect_get_datagram_data()
+        .returning(move || (vec![EnvoyBuffer::new(runt)], runt.len()));
+    envoy.expect_set_datagram_data().never();
+    let mut f = strict.new_udp_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
+
+    let lax = udp_config("ula fd2a:5c1b:7e90::/48\nrequire_ppv2 false\n");
+    let mut envoy2 = MockEnvoyUdpListenerFilter::new();
+    envoy2
+        .expect_get_datagram_data()
+        .returning(move || (vec![EnvoyBuffer::new(runt)], runt.len()));
+    envoy2.expect_set_datagram_data().never();
+    let mut f2 = lax.new_udp_listener_filter(&mut envoy2);
+    assert_eq!(f2.on_data(&mut envoy2), UdpStatus::Continue);
+}
+
+#[test]
 fn an_empty_allowlist_denies_a_well_formed_tenant() {
     // Security-group semantics all the way through the filter, not just the set.
     let dg = leak(build(
