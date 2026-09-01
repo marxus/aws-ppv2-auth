@@ -1,0 +1,20 @@
+# The module references envoy_dynamic_module_callback_* symbols that only exist
+# inside the Envoy process at dlopen time. Linux shared objects allow undefined
+# symbols; macOS does not, so a host build needs dynamic_lookup.
+#
+# Only needed to build and test on a Mac. The deployable artifact targets
+# aarch64-unknown-linux-gnu, where this is unnecessary -- which is why the Zig
+# build never hit it: it cross-compiles to Linux by default.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
+
+# Cross-compiling to the data plane's platform needs cargo-zigbuild, not plain
+# `cargo --target`. Two things get in the way and zigbuild fixes both:
+#   * bindgen needs the target sysroot to parse abi.h
+#   * rustc passes --fix-cortex-a53-843419 for aarch64, which `zig cc` rejects
+#       error: unsupported linker arg: --fix-cortex-a53-843419
+# Upstream's Dockerfile uses cargo-zigbuild for exactly this reason. Build with:
+#   PATH="$PATH:$HOME/.cargo/bin" cargo zigbuild --release --target aarch64-unknown-linux-gnu

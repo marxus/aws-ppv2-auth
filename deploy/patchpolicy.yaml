@@ -1,0 +1,68 @@
+# Attaching the module to listeners.
+#
+# Envoy Gateway has no CRD for listener filters, so this is raw xDS via
+# EnvoyPatchPolicy. Requires `enableEnvoyPatchPolicy: true` in the Envoy Gateway
+# Helm values; it is off by default.
+#
+# ONE POLICY PER GATEWAY. A second EnvoyPatchPolicy targeting the same Gateway is
+# silently ignored -- no status conditions, no error. Merge all patches here.
+#
+# path: /listener_filters/0 -- the module must run BEFORE udp_proxy, and JSON
+# Patch `add` at index 0 inserts and shifts.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  name: aws-ppv2-identity
+  namespace: envoy-gateway-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gw
+  type: JSONPatch
+  jsonPatches:
+    # --- TCP / TLS listeners: label the connection, then let policy match it ---
+    #
+    # Do NOT also enable Envoy's own proxy_protocol filter on these listeners
+    # (ClientTrafficPolicy.enableProxyProtocol). Only one of the two can drain
+    # the header.
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: envoy-gateway-system/gw/https
+      operation:
+        op: add
+        path: /listener_filters/0
+        value:
+          name: aws-ppv2
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.dynamic_modules.v3.DynamicModuleListenerFilter
+            dynamic_module_config: { name: aws-ppv2 }
+            filter_name: aws-ppv2
+            filter_config:
+              "@type": type.googleapis.com/google.protobuf.StringValue
+              # Generate your own /48 once, per RFC 4193: fd + 40 random bits.
+              value: |
+                ula fd2a:5c1b:7e90::/48
+
+    # --- UDP listeners: the filter enforces, because nothing downstream can ---
+    #
+    # udp_proxy has no RBAC filter and the UDP ABI cannot attach an identity to a
+    # session, so a SecurityPolicy has nothing to match. The allowlist below is
+    # the only enforcement point on this path.
+    #
+    # ALLOWLIST ONLY, like a security group: an empty list denies everything.
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: envoy-gateway-system/gw/dns
+      operation:
+        op: add
+        path: /listener_filters/0
+        value:
+          name: aws-ppv2
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.udp.dynamic_modules.v3.DynamicModuleUdpListenerFilter
+            dynamic_module_config: { name: aws-ppv2 }
+            filter_name: aws-ppv2
+            filter_config:
+              "@type": type.googleapis.com/google.protobuf.StringValue
+              value: |
+                ula   fd2a:5c1b:7e90::/48
+                allow fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128

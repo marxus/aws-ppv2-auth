@@ -1,0 +1,35 @@
+[package]
+name = "aws-ppv2-identity"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Envoy dynamic module: AWS PROXY protocol v2 identity as a matchable IPv6 address"
+repository = "https://github.com/marxus/aws-ppv2-identity"
+
+[dependencies]
+# PINNED TO THE ENVOY THIS RUNS IN, and that is not a style choice -- upstream
+# calls the compatibility requirement strict. Bump this in the same commit as the
+# Envoy image; bindgen then regenerates the ABI from that tag's abi.h, so a
+# mismatch is a build error rather than a runtime surprise.
+#
+# NOTE Envoy only WARNS on an ABI version mismatch at load, it does not fail
+# (source/extensions/dynamic_modules/dynamic_modules.cc). So the pin is the only
+# real guard -- see README, "Upgrading Envoy".
+envoy-proxy-dynamic-modules-rust-sdk = { git = "https://github.com/envoyproxy/envoy", tag = "v1.39.1" }
+sha2 = { version = "0.10", features = ["asm"] }
+
+[lib]
+# Produces libaws_ppv2.so. CI renames it to libaws-ppv2.so, because Envoy loads
+# lib<name>.so and Envoy Gateway's module-name pattern
+# (^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$) forbids the underscore Rust insists on.
+name = "aws_ppv2"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# MUST stay "unwind". The SDK wraps every FFI entry point in catch_unwind, which
+# is what turns a parser bug into a logged panic instead of a dead Envoy worker.
+panic = "unwind"

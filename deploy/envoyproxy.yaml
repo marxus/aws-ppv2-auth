@@ -1,0 +1,48 @@
+# How to get the module into Envoy Gateway's data plane.
+#
+# The image is MOUNTED, not copied. volumes[].image is a native OCI volume
+# source (beta since Kubernetes 1.33), so there is no initContainer, no cp, and
+# no ConfigMap. The image is FROM scratch and contains exactly one file, so the
+# mount root is that file's directory.
+#
+# Why not a ConfigMap: binaryData is stored base64, so the object carries 4/3 of
+# the file, and it must fit etcd's ~1.5MiB request ceiling. That works for a
+# 250KB module and stops working as it grows -- and it makes the binary part of
+# your cluster state instead of a released artifact.
+#
+# Why not dynamicModules' source.remote: it takes a single url, so the
+# architecture ends up hardcoded in this YAML, and every proxy restart becomes a
+# runtime dependency on that host being reachable. A manifest list solves both.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: envoy-proxy
+  namespace: envoy-gateway-system
+spec:
+  # IPv6 or DualStack is REQUIRED for the identity scheme to be reachable at all
+  # if your listeners must accept IPv6. Left at the default, Envoy binds 0.0.0.0
+  # and refuses every IPv6 connection. Matching IPv6 clientCIDRs does not depend
+  # on this -- the address being matched is a value the module declared, not a
+  # socket -- but your listeners do.
+  ipFamily: IPv6
+
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyDeployment:
+        pod:
+          volumes:
+            - name: aws-ppv2
+              image:
+                reference: ghcr.io/marxus/aws-ppv2-identity:v0.1.0
+                pullPolicy: IfNotPresent
+        container:
+          volumeMounts:
+            - name: aws-ppv2
+              mountPath: /modules
+              readOnly: true
+          env:
+            # Envoy resolves a module named `foo` as lib<foo>.so from the standard
+            # search path, so the mount directory has to be on it.
+            - name: LD_LIBRARY_PATH
+              value: /modules

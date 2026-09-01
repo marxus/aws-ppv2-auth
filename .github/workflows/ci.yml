@@ -1,0 +1,54 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      # bindgen parses Envoy's abi.h and needs libclang.
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+
+  # The .so is what ships, so prove both architectures link on every PR rather
+  # than finding out at release time.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: mlugg/setup-zig@v1
+      - run: sudo apt-get update && sudo apt-get install -y clang
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-zigbuild --locked
+      - run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: exported hooks are present
+        run: |
+          set -eu
+          so=target/${{ matrix.target }}/release/libaws_ppv2.so
+          test -f "$so"
+          # Envoy resolves the ENTIRE hook set when building a filter config, so a
+          # missing symbol is a startup failure, not a runtime one. Assert them.
+          for sym in \
+            envoy_dynamic_module_on_program_init \
+            envoy_dynamic_module_on_listener_filter_config_new \
+            envoy_dynamic_module_on_listener_filter_on_data \
+            envoy_dynamic_module_on_udp_listener_filter_config_new \
+            envoy_dynamic_module_on_udp_listener_filter_on_data ; do
+            nm -D --defined-only "$so" | grep -q " $sym$" \
+              || { echo "missing exported hook: $sym" >&2; exit 1; }
+          done
+          echo "size: $(stat -c%s "$so") bytes"
