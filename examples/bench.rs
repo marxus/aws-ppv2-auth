@@ -1,7 +1,7 @@
 //! Pure-logic benchmark, matched op-for-op with the Zig module's _bench and the
 //! Go port, so the three numbers are comparable. Same 112-byte PrivateLink
 //! header, same 10,000-entry allowlist, same worst-case lookup (last entry).
-use aws_ppv2::{cidr, identity, ppv2 as pp};
+use aws_ppv2_identity::{cidr, identity, ppv2 as pp};
 use std::time::Instant;
 
 const PREFIX: identity::Prefix = [0xfd, 0x2a, 0x5c, 0x1b, 0x7e, 0x90];

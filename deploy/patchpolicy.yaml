@@ -32,11 +32,11 @@ spec:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2
+          name: aws-ppv2-identity
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.dynamic_modules.v3.DynamicModuleListenerFilter
-            dynamic_module_config: { name: aws-ppv2 }
-            filter_name: aws-ppv2
+            dynamic_module_config: { name: aws-ppv2-identity }
+            filter_name: aws-ppv2-identity
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
               # Generate your own /48 once, per RFC 4193: fd + 40 random bits.
@@ -56,11 +56,11 @@ spec:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2
+          name: aws-ppv2-identity
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.udp.dynamic_modules.v3.DynamicModuleUdpListenerFilter
-            dynamic_module_config: { name: aws-ppv2 }
-            filter_name: aws-ppv2
+            dynamic_module_config: { name: aws-ppv2-identity }
+            filter_name: aws-ppv2-identity
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
               value: |

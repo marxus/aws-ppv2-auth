@@ -39,7 +39,7 @@ jobs:
       - name: exported hooks are present
         run: |
           set -eu
-          so=target/${{ matrix.target }}/release/libaws_ppv2.so
+          so=target/${{ matrix.target }}/release/libaws_ppv2_identity.so
           test -f "$so"
           # Envoy resolves the ENTIRE hook set when building a filter config, so a
           # missing symbol is a startup failure, not a runtime one. Assert them.

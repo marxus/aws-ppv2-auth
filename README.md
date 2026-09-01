@@ -78,10 +78,10 @@ and no ConfigMap:
 ```yaml
 pod:
   volumes:
-    - name: aws-ppv2
-      image: { reference: ghcr.io/marxus/aws-ppv2-identity:v0.1.0 }
+    - name: aws-ppv2-identity
+      image: { reference: ghcr.io/marxus/aws-ppv2-identity:v0.1.2 }
 container:
-  volumeMounts: [{ name: aws-ppv2, mountPath: /modules, readOnly: true }]
+  volumeMounts: [{ name: aws-ppv2-identity, mountPath: /modules, readOnly: true }]
   env: [{ name: LD_LIBRARY_PATH, value: /modules }]
 ```
 
