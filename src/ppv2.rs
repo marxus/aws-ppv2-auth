@@ -85,7 +85,7 @@ const TLV_HEADER: usize = 3;
 /// Measured against a live NLB the largest header is 112 bytes (UDP over IPv6);
 /// TCP is 84. 256 leaves room for TLVs AWS might add and still caps the ratio
 /// at 16x.
-const MAX_HEADER: usize = 256;
+pub const MAX_HEADER: usize = 256;
 
 /// The address block carries a source and destination port after the addresses.
 const PORTS: usize = 4;

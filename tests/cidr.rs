@@ -32,6 +32,22 @@ fn single_host_slash_128_and_slash_0_edges() {
 }
 
 #[test]
+fn the_span_short_circuit_agrees_with_the_search_at_its_edges() {
+    // `contains` rejects anything outside [first.start, last.end] without
+    // searching. The risk of that guard is an off-by-one at the two boundaries,
+    // so pin both: the exact edges must still be inside.
+    let s = cidr::build("fd2a:5c1b:7e90:1::/64, fd2a:5c1b:7e90:9::/64").unwrap();
+    assert!(s.contains(p("fd2a:5c1b:7e90:1::"))); // first start, exactly
+    assert!(s.contains(p("fd2a:5c1b:7e90:9:ffff:ffff:ffff:ffff"))); // last end, exactly
+
+    assert!(!s.contains(p("fd2a:5c1b:7e90:0:ffff:ffff:ffff:ffff"))); // one below
+    assert!(!s.contains(p("fd2a:5c1b:7e90:a::"))); // one above
+    assert!(!s.contains(p("fd2a:5c1b:7e90:5::1"))); // in the span, in the gap
+    assert!(!s.contains(0));
+    assert!(!s.contains(u128::MAX));
+}
+
+#[test]
 fn overlaps_collapse() {
     let s = cidr::build("fd00::/16, fd00:1::/32, fd00:2::/32").unwrap(); // all inside /16
     assert_eq!(s.len(), 1);

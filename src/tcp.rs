@@ -28,7 +28,15 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for FilterConfig {
         // ignore edits to the EnvoyPatchPolicy.
         Box::new(Filter {
             cfg: self.cfg.clone(),
-            want: ppv2::PREAMBLE,
+            // Ask for the whole ceiling up front rather than the preamble. Two
+            // things fall out: `want` can never exceed this, so Envoy's
+            // resetCapacity never fires and there is one allocation instead of
+            // two; and a real 84 or 112 byte header completes on the FIRST
+            // on_data instead of peek-16, Need(n), resize, peek again. Costs
+            // nothing in worst-case memory -- MAX_HEADER already set that
+            // ceiling. Safe because Envoy peeks with MSG_PEEK and calls on_data
+            // on a short read, so a larger buffer never waits for more bytes.
+            want: ppv2::MAX_HEADER,
             done: false,
             refused: false,
         })

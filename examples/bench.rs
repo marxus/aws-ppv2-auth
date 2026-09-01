@@ -96,6 +96,23 @@ fn main() {
         }
         s
     });
+    // The deny path, which is the one an attacker controls the volume of. A real
+    // internet address sits outside the allowlist's span, so this measures the
+    // short circuit rather than the search.
+    let outside = identity::to_u128(
+        "2a05:d014:10da:7800::1"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    assert!(!set.contains(outside));
+    bench("Lookup10kDeny", 50_000_000, |n| {
+        let mut s = 0u64;
+        for _ in 0..n {
+            s = s.wrapping_add(set.contains(outside) as u64);
+        }
+        s
+    });
     bench("FullPath", 20_000_000, |n| {
         let mut s = 0u64;
         for _ in 0..n {

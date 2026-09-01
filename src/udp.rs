@@ -102,8 +102,13 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
         };
 
         match decision {
-            Decision::Forward if envoy.set_datagram_data(&self.payload) => Status::Continue,
-            Decision::Forward => Status::StopIteration,
+            Decision::Forward => {
+                if envoy.set_datagram_data(&self.payload) {
+                    Status::Continue
+                } else {
+                    Status::StopIteration
+                }
+            }
             Decision::Denied => Status::StopIteration,
             Decision::NotProxyProtocol => {
                 if self.cfg.require_ppv2 {

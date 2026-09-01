@@ -41,7 +41,7 @@ pub struct Config {
 pub fn parse(text: &str) -> Result<Config, &'static str> {
     let mut prefix: Option<identity::Prefix> = None;
     let mut require_ppv2 = true;
-    let mut allow = String::new();
+    let mut allow: Vec<&str> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -54,10 +54,7 @@ pub fn parse(text: &str) -> Result<Config, &'static str> {
         };
         match key {
             "ula" => prefix = Some(identity::parse_prefix(val)?),
-            "allow" => {
-                allow.push_str(val);
-                allow.push(',');
-            }
+            "allow" => allow.push(val),
             // Strict, for the same reason unknown keys are: `require_ppv2 no`
             // silently meaning `true` is the kind of thing found during an
             // incident, not before one.
@@ -74,7 +71,7 @@ pub fn parse(text: &str) -> Result<Config, &'static str> {
         }
     }
 
-    let allow = cidr::build(&allow)?;
+    let allow = cidr::build_from(allow.into_iter())?;
     // The UDP filter only consults the allowlist on a header it parsed. With
     // require_ppv2 off, anything unparseable is passed through instead --
     // straight past every `allow` line. Writing both is asking for an allowlist
