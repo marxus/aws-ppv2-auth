@@ -41,7 +41,7 @@ spec:
               "@type": type.googleapis.com/google.protobuf.StringValue
               # Generate your own /48 once, per RFC 4193: fd + 40 random bits.
               value: |
-                ula fd2a:5c1b:7e90::/48
+                ula fd00:dead:beef::/48
 
     # --- UDP listeners: the filter enforces, because nothing downstream can ---
     #
@@ -64,5 +64,5 @@ spec:
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
               value: |
-                ula   fd2a:5c1b:7e90::/48
-                allow fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128
+                ula   fd00:dead:beef::/48
+                allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128

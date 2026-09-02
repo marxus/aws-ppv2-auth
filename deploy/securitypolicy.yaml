@@ -7,7 +7,7 @@
 # expressible at all.
 #
 # Reproduce any tenant address with:
-#   printf %s vpce-028ff61de1d1fea8c | sha256sum | cut -c1-16
+#   printf %s vpce-0123456789abcdef0 | sha256sum | cut -c1-16
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: SecurityPolicy
 metadata:
@@ -26,22 +26,22 @@ spec:
       - name: tenant-a
         action: Allow
         principal:
-          clientCIDRs: [fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128]
+          clientCIDRs: [fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128]
 
       # Coarse rules the kind nibble gives you for free.
       - name: any-privatelink-tenant
         action: Allow
         principal:
-          clientCIDRs: [fd2a:5c1b:7e90:1::/64]
+          clientCIDRs: [fd00:dead:beef:1::/64]
 
       # An IPv4 CIDR maps mechanically onto /(96+N): 10.1.0.0/16 -> :4::a01:0/112
       - name: edge-tier-ipv4
         action: Allow
         principal:
-          clientCIDRs: [fd2a:5c1b:7e90:4::a01:0/112]
+          clientCIDRs: [fd00:dead:beef:4::a01:0/112]
 
       # IPv6 clients keep their real addresses, so write ordinary CIDRs.
       - name: known-ipv6-range
         action: Allow
         principal:
-          clientCIDRs: [2a05:d014:10da:7800::/56]
+          clientCIDRs: [2001:db8:10da:7800::/56]

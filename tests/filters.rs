@@ -13,9 +13,9 @@ use std::sync::Arc;
 use abi::envoy_dynamic_module_type_on_listener_filter_status as TcpStatus;
 use abi::envoy_dynamic_module_type_on_udp_listener_filter_status as UdpStatus;
 
-const ULA: &str = "ula fd2a:5c1b:7e90::/48\n";
-/// sha256("vpce-028ff61de1d1fea8c")[..8] -- see tests/identity.rs.
-const TENANT: &str = "allow fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128\n";
+const ULA: &str = "ula fd00:dead:beef::/48\n";
+/// sha256("vpce-0123456789abcdef0")[..8] -- see tests/identity.rs.
+const TENANT: &str = "allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128\n";
 
 fn tcp_config(text: &str) -> tcp::FilterConfig {
     tcp::FilterConfig {
@@ -64,7 +64,7 @@ fn a_refused_connection_is_not_admitted_by_a_later_on_data() {
 
 #[test]
 fn require_ppv2_false_still_passes_non_ppv2_through() {
-    let fc = tcp_config("ula fd2a:5c1b:7e90::/48\nrequire_ppv2 false\n");
+    let fc = tcp_config("ula fd00:dead:beef::/48\nrequire_ppv2 false\n");
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -81,7 +81,7 @@ fn a_tenant_header_is_labelled_with_the_synthesized_address_and_drained() {
         V2_PROXY,
         0x11,
         &[10, 0, 1, 28],
-        Some(b"vpce-028ff61de1d1fea8c"),
+        Some(b"vpce-0123456789abcdef0"),
     ));
     let fc = tcp_config(ULA);
     let mut envoy = MockEnvoyListenerFilter::new();
@@ -90,7 +90,7 @@ fn a_tenant_header_is_labelled_with_the_synthesized_address_and_drained() {
         .returning(move || Some(EnvoyBuffer::new(hdr)));
     envoy
         .expect_set_remote_address()
-        .withf(|addr, _port, is_ipv6| addr == "fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a" && *is_ipv6)
+        .withf(|addr, _port, is_ipv6| addr == "fd00:dead:beef:1:7b53:e75b:6e3d:cfdb" && *is_ipv6)
         .times(1)
         .returning(|_, _, _| true);
     // The whole header is stripped, so the backend sees only its own protocol.
@@ -151,7 +151,7 @@ fn an_allowed_datagram_is_stripped_and_forwarded() {
         V2_PROXY,
         0x12,
         &[10, 0, 1, 28],
-        Some(b"vpce-028ff61de1d1fea8c"),
+        Some(b"vpce-0123456789abcdef0"),
     );
     let hdr_len = dg_vec.len();
     dg_vec.extend_from_slice(payload);
@@ -188,7 +188,7 @@ fn a_short_datagram_obeys_require_ppv2_like_every_other_parse_failure() {
     let mut f = strict.new_udp_listener_filter(&mut envoy);
     assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
 
-    let lax = udp_config("ula fd2a:5c1b:7e90::/48\nrequire_ppv2 false\n");
+    let lax = udp_config("ula fd00:dead:beef::/48\nrequire_ppv2 false\n");
     let mut envoy2 = MockEnvoyUdpListenerFilter::new();
     envoy2
         .expect_get_datagram_data()
@@ -205,7 +205,7 @@ fn an_empty_allowlist_denies_a_well_formed_tenant() {
         V2_PROXY,
         0x12,
         &[10, 0, 1, 28],
-        Some(b"vpce-028ff61de1d1fea8c"),
+        Some(b"vpce-0123456789abcdef0"),
     ));
     let fc = udp_config(ULA);
     let mut envoy = MockEnvoyUdpListenerFilter::new();

@@ -12,11 +12,11 @@ fn privatelink_datagram_header_yields_the_vpce_id() {
         V2_PROXY,
         0x12,
         &[10, 0, 1, 28],
-        Some(b"vpce-028ff61de1d1fea8c"),
+        Some(b"vpce-0123456789abcdef0"),
     );
     let h = ppv2::parse(&buf).unwrap();
     assert!(!h.is_v6);
-    assert_eq!(h.vpce, b"vpce-028ff61de1d1fea8c");
+    assert_eq!(h.vpce, b"vpce-0123456789abcdef0");
     assert_eq!(&h.src[..4], &[10, 0, 1, 28]);
     assert_eq!(h.len, buf.len());
 }
@@ -31,7 +31,7 @@ fn internet_stream_header_has_no_vpce_id() {
 
 #[test]
 fn ipv6_source_and_port_come_from_the_right_offsets() {
-    let addr: [u8; 16] = "2a05:d014:10da:7800:eb7a::5837"
+    let addr: [u8; 16] = "2001:db8:10da:7800:eb7a::5837"
         .parse::<std::net::Ipv6Addr>()
         .unwrap()
         .octets();
@@ -131,7 +131,7 @@ fn an_oversized_declared_length_is_rejected_not_buffered() {
         V2_PROXY,
         0x12,
         &[10, 0, 1, 28],
-        Some(b"vpce-028ff61de1d1fea8c"),
+        Some(b"vpce-0123456789abcdef0"),
     );
     assert!(real.len() < 256);
     assert!(ppv2::parse(&real).is_ok());

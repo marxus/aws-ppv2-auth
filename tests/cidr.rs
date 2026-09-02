@@ -9,24 +9,24 @@ fn p(t: &str) -> u128 {
 
 #[test]
 fn membership_boundaries_and_gaps() {
-    let s = cidr::build("fd2a:5c1b:7e90:1::/64, fd2a:5c1b:7e90:4::12c7:0/112").unwrap();
-    assert!(s.contains(p("fd2a:5c1b:7e90:1::1"))); // in /64
-    assert!(s.contains(p("fd2a:5c1b:7e90:1:ffff:ffff:ffff:ffff"))); // last of /64
-    assert!(!s.contains(p("fd2a:5c1b:7e90:2::1"))); // next /64 out
-    assert!(s.contains(p("fd2a:5c1b:7e90:4::12c7:e6a1"))); // in /112
-    assert!(!s.contains(p("fd2a:5c1b:7e90:4::a00:11c"))); // outside /112
+    let s = cidr::build("fd00:dead:beef:1::/64, fd00:dead:beef:4::12c7:0/112").unwrap();
+    assert!(s.contains(p("fd00:dead:beef:1::1"))); // in /64
+    assert!(s.contains(p("fd00:dead:beef:1:ffff:ffff:ffff:ffff"))); // last of /64
+    assert!(!s.contains(p("fd00:dead:beef:2::1"))); // next /64 out
+    assert!(s.contains(p("fd00:dead:beef:4::12c7:e6a1"))); // in /112
+    assert!(!s.contains(p("fd00:dead:beef:4::a00:11c"))); // outside /112
     assert!(!s.contains(p("fd00:dead::1"))); // unrelated
 }
 
 #[test]
 fn single_host_slash_128_and_slash_0_edges() {
-    let s = cidr::build("fd2a:5c1b:7e90:1::1/128").unwrap();
-    assert!(s.contains(p("fd2a:5c1b:7e90:1::1")));
-    assert!(!s.contains(p("fd2a:5c1b:7e90:1::2")));
-    assert!(!s.contains(p("fd2a:5c1b:7e90:1::0")));
+    let s = cidr::build("fd00:dead:beef:1::1/128").unwrap();
+    assert!(s.contains(p("fd00:dead:beef:1::1")));
+    assert!(!s.contains(p("fd00:dead:beef:1::2")));
+    assert!(!s.contains(p("fd00:dead:beef:1::0")));
 
     let all = cidr::build("::/0").unwrap();
-    assert!(all.contains(p("2a05:d014::1")));
+    assert!(all.contains(p("2001:db8::1")));
     assert!(all.contains(0));
     assert!(all.contains(u128::MAX));
 }
@@ -36,13 +36,13 @@ fn the_span_short_circuit_agrees_with_the_search_at_its_edges() {
     // `contains` rejects anything outside [first.start, last.end] without
     // searching. The risk of that guard is an off-by-one at the two boundaries,
     // so pin both: the exact edges must still be inside.
-    let s = cidr::build("fd2a:5c1b:7e90:1::/64, fd2a:5c1b:7e90:9::/64").unwrap();
-    assert!(s.contains(p("fd2a:5c1b:7e90:1::"))); // first start, exactly
-    assert!(s.contains(p("fd2a:5c1b:7e90:9:ffff:ffff:ffff:ffff"))); // last end, exactly
+    let s = cidr::build("fd00:dead:beef:1::/64, fd00:dead:beef:9::/64").unwrap();
+    assert!(s.contains(p("fd00:dead:beef:1::"))); // first start, exactly
+    assert!(s.contains(p("fd00:dead:beef:9:ffff:ffff:ffff:ffff"))); // last end, exactly
 
-    assert!(!s.contains(p("fd2a:5c1b:7e90:0:ffff:ffff:ffff:ffff"))); // one below
-    assert!(!s.contains(p("fd2a:5c1b:7e90:a::"))); // one above
-    assert!(!s.contains(p("fd2a:5c1b:7e90:5::1"))); // in the span, in the gap
+    assert!(!s.contains(p("fd00:dead:beef:0:ffff:ffff:ffff:ffff"))); // one below
+    assert!(!s.contains(p("fd00:dead:beef:a::"))); // one above
+    assert!(!s.contains(p("fd00:dead:beef:5::1"))); // in the span, in the gap
     assert!(!s.contains(0));
     assert!(!s.contains(u128::MAX));
 }
@@ -59,7 +59,7 @@ fn an_empty_list_denies_everything() {
     // nothing is permitted. See config.rs for why there is no enforce flag.
     let s = cidr::build("").unwrap();
     assert!(s.is_empty());
-    assert!(!s.contains(p("fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a")));
+    assert!(!s.contains(p("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb")));
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn ten_thousand_unique_slash_128_host_addresses() {
     let mut list = String::new();
     for i in 0..10_000u32 {
         list.push_str(&format!(
-            "fd2a:5c1b:7e90:1:0:0:{:x}:{:x}/128,",
+            "fd00:dead:beef:1:0:0:{:x}:{:x}/128,",
             i >> 16,
             i & 0xffff
         ));
@@ -75,7 +75,7 @@ fn ten_thousand_unique_slash_128_host_addresses() {
     let s = cidr::build(&list).unwrap();
     assert_eq!(s.len(), 10_000);
 
-    let hit = p("fd2a:5c1b:7e90:1:0:0:0:1388");
+    let hit = p("fd00:dead:beef:1:0:0:0:1388");
     assert!(s.contains(hit));
     // NB: entries here are sequential, so hit^1 is the NEXT entry, not a
     // miss. Flip a high bit to land outside the populated block.

@@ -2,8 +2,8 @@
 //! See README for the format and the two rejected combinations.
 //!
 //! ```text
-//! ula          fd2a:5c1b:7e90::/48
-//! allow        fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128
+//! ula          fd00:dead:beef::/48
+//! allow        fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
 //! require_ppv2 true
 //! ```
 //!

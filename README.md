@@ -13,7 +13,7 @@ Every policy engine here matches addresses — Envoy RBAC, `CiliumNetworkPolicy`
 and none can match a `vpce-id`. So synthesize one:
 
 ```text
-fd2a:5c1b:7e90 : 0001 : e3b1:45a8:c041:e80a
+fd00:dead:beef : 0001 : 7b53:e75b:6e3d:cfdb
 └── /48 ULA ──┘  └kind┘  └── 64-bit body ──┘
                     1 = sha256(vpce-id) truncated
                     4 = 4via6, client IPv4 in the low 32 bits
@@ -21,7 +21,7 @@ fd2a:5c1b:7e90 : 0001 : e3b1:45a8:c041:e80a
 
 Derived, not mapped, so the data plane holds no tenant knowledge — adding a
 tenant is one policy rule. Reproduce any value with
-`printf %s vpce-028ff61de1d1fea8c | sha256sum | cut -c1-16`.
+`printf %s vpce-0123456789abcdef0 | sha256sum | cut -c1-16`.
 
 | header says | result |
 |---|---|
@@ -47,8 +47,8 @@ layers:
 ```yaml
 principal:
   clientCIDRs:
-    - fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128   # one tenant
-    - fd2a:5c1b:7e90:4::12c7:0/112               # 18.199.0.0/16
+    - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128   # one tenant
+    - fd00:dead:beef:4::12c7:0/112               # 18.199.0.0/16
 ```
 
 No header injection, no CEL. `clientCIDRs` is the *only* principal a `TCPRoute`
@@ -80,9 +80,9 @@ A `google.protobuf.StringValue` in `filter_config`, line-oriented so a
 `kubectl diff` of 10,000 entries stays readable:
 
 ```text
-ula   fd2a:5c1b:7e90::/48
-allow fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a/128
-allow 2a05:d014:10da:7800::/56
+ula   fd00:dead:beef::/48
+allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+allow 2001:db8:10da:7800::/56
 ```
 
 Generate your own `ula` once per RFC 4193: `fd` plus 40 random bits, nothing set

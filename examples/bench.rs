@@ -3,10 +3,10 @@
 use aws_ppv2_identity::{cidr, identity, ppv2 as pp};
 use std::time::Instant;
 
-const PREFIX: identity::Prefix = [0xfd, 0x2a, 0x5c, 0x1b, 0x7e, 0x90];
+const PREFIX: identity::Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];
 
 fn pl_header() -> Vec<u8> {
-    let vpce = b"vpce-028ff61de1d1fea8c";
+    let vpce = b"vpce-0123456789abcdef0";
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(&[10, 0, 1, 28, 10, 1, 2, 67, 0x9c, 0x40, 0x00, 0x50]);
     body.extend_from_slice(&[0x03, 0x00, 0x04, 0, 0, 0, 0]); // CRC32C
@@ -48,7 +48,7 @@ fn main() {
     let mut list = String::new();
     for i in 0..10_000u32 {
         list.push_str(&format!(
-            "fd2a:5c1b:7e90:1:0:0:{:x}:{:x}/128,",
+            "fd00:dead:beef:1:0:0:{:x}:{:x}/128,",
             i >> 16,
             i & 0xffff
         ));
@@ -65,7 +65,7 @@ fn main() {
 
     let set = cidr::build(&list).unwrap();
     let key = identity::to_u128(
-        "fd2a:5c1b:7e90:1:0:0:0:270f"
+        "fd00:dead:beef:1:0:0:0:270f"
             .parse::<std::net::Ipv6Addr>()
             .unwrap()
             .octets(),
@@ -97,7 +97,7 @@ fn main() {
     // Deny path: a real internet address sits outside the allowlist's span, so
     // this measures the short circuit rather than the search.
     let outside = identity::to_u128(
-        "2a05:d014:10da:7800::1"
+        "2001:db8:10da:7800::1"
             .parse::<std::net::Ipv6Addr>()
             .unwrap()
             .octets(),

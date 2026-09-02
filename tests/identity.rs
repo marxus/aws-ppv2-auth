@@ -7,7 +7,7 @@ use aws_ppv2_identity::identity::{
 use aws_ppv2_identity::ppv2;
 use std::net::Ipv6Addr;
 
-const TEST_PREFIX: Prefix = [0xfd, 0x2a, 0x5c, 0x1b, 0x7e, 0x90];
+const TEST_PREFIX: Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];
 
 fn hdr_v4(vpce: &[u8], v4: [u8; 4]) -> ppv2::Header<'_> {
     let mut src = [0u8; 16];
@@ -36,23 +36,23 @@ fn hdr_v6<'a>(vpce: &'a [u8], addr: &str) -> ppv2::Header<'a> {
 fn vpce_id_hashes_into_the_kind_1_slash_64_stably() {
     let a = synthesize(
         TEST_PREFIX,
-        &hdr_v4(b"vpce-028ff61de1d1fea8c", [10, 0, 1, 28]),
+        &hdr_v4(b"vpce-0123456789abcdef0", [10, 0, 1, 28]),
     );
     let b = synthesize(
         TEST_PREFIX,
-        &hdr_v4(b"vpce-028ff61de1d1fea8c", [9, 9, 9, 9]),
+        &hdr_v4(b"vpce-0123456789abcdef0", [9, 9, 9, 9]),
     );
     // Derived from the id alone -- the client address must not perturb it.
     assert_eq!(a, b);
     assert_eq!(u16::from_be_bytes([a[6], a[7]]), KIND_VPCE);
-    assert_eq!(format(a).as_str(), "fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a");
+    assert_eq!(format(a).as_str(), "fd00:dead:beef:1:7b53:e75b:6e3d:cfdb");
 }
 
 #[test]
 fn different_tenants_land_on_different_addresses() {
     let a = synthesize(
         TEST_PREFIX,
-        &hdr_v4(b"vpce-028ff61de1d1fea8c", [1, 1, 1, 1]),
+        &hdr_v4(b"vpce-0123456789abcdef0", [1, 1, 1, 1]),
     );
     let b = synthesize(
         TEST_PREFIX,
@@ -68,7 +68,7 @@ fn no_vpce_id_falls_back_to_4via6_with_the_client_ipv4_in_the_low_32_bits() {
     let a = synthesize(TEST_PREFIX, &hdr_v4(b"", [18, 199, 230, 161]));
     assert_eq!(u16::from_be_bytes([a[6], a[7]]), KIND_VIA4);
     assert_eq!(&a[12..16], &[18, 199, 230, 161]);
-    assert_eq!(format(a).as_str(), "fd2a:5c1b:7e90:4::12c7:e6a1");
+    assert_eq!(format(a).as_str(), "fd00:dead:beef:4::12c7:e6a1");
 }
 
 #[test]
@@ -83,7 +83,7 @@ fn the_two_kinds_never_collide() {
 
 #[test]
 fn a_real_ipv6_client_is_passed_through_not_encoded() {
-    let h = hdr_v6(b"", "2a05:d014:10da:7800:eb7a::5837");
+    let h = hdr_v6(b"", "2001:db8:10da:7800:eb7a::5837");
     let a = synthesize(TEST_PREFIX, &h);
     // Byte-identical, all 128 bits, and outside the ULA -- the invariant is
     // that everything this module synthesizes is inside the /48 and nothing
@@ -94,10 +94,10 @@ fn a_real_ipv6_client_is_passed_through_not_encoded() {
     // A tenant arriving over IPv6 is still a tenant: vpce branch comes first.
     let t = synthesize(
         TEST_PREFIX,
-        &hdr_v6(b"vpce-028ff61de1d1fea8c", "2a05:d014::1"),
+        &hdr_v6(b"vpce-0123456789abcdef0", "2001:db8::1"),
     );
     assert_eq!(u16::from_be_bytes([t[6], t[7]]), KIND_VPCE);
-    assert_eq!(format(t).as_str(), "fd2a:5c1b:7e90:1:e3b1:45a8:c041:e80a");
+    assert_eq!(format(t).as_str(), "fd00:dead:beef:1:7b53:e75b:6e3d:cfdb");
 }
 
 #[test]
@@ -107,22 +107,22 @@ fn an_ipv6_client_cannot_collide_with_an_ipv4_rule() {
     // 42.5.208.20. Global unicast is 2000::/3, so EVERY v6 client landed in
     // IPv4 32-63.x.x.x -- the band holding 34/35 (GCP), 52/54 (AWS) and
     // 42/43 (APNIC).
-    let v6 = synthesize(TEST_PREFIX, &hdr_v6(b"", "2a05:d014:10da:7800:eb7a::5837"));
+    let v6 = synthesize(TEST_PREFIX, &hdr_v6(b"", "2001:db8:10da:7800:eb7a::5837"));
     let v4 = synthesize(TEST_PREFIX, &hdr_v4(b"", [42, 5, 208, 20]));
     assert_ne!(v6, v4);
 
     // And two v6 clients in one /32 stay distinct, rather than collapsing.
-    let other = synthesize(TEST_PREFIX, &hdr_v6(b"", "2a05:d014:ffff:9999::1"));
+    let other = synthesize(TEST_PREFIX, &hdr_v6(b"", "2001:db8:ffff:9999::1"));
     assert_ne!(v6, other);
 }
 
 #[test]
 fn prefix_parsing_insists_on_a_ula_slash_48() {
-    assert_eq!(parse_prefix("fd2a:5c1b:7e90::/48").unwrap(), TEST_PREFIX);
-    assert!(parse_prefix("fd2a:5c1b:7e90::").is_ok()); // bare form accepted
+    assert_eq!(parse_prefix("fd00:dead:beef::/48").unwrap(), TEST_PREFIX);
+    assert!(parse_prefix("fd00:dead:beef::").is_ok()); // bare form accepted
     assert_eq!(parse_prefix("2001:db8::/48"), Err("not unique-local"));
     assert_eq!(
-        parse_prefix("fd2a:5c1b:7e90::/64"),
+        parse_prefix("fd00:dead:beef::/64"),
         Err("prefix must be /48")
     );
 }

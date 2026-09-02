@@ -3,7 +3,7 @@
 //! ULA /48, everything outside it is a real client address.
 //!
 //! ```text
-//! fd2a:5c1b:7e90 : 0001 : e3b1:45a8:c041:e80a
+//! fd00:dead:beef : 0001 : 7b53:e75b:6e3d:cfdb
 //! └── /48 ULA ──┘  └kind┘  └── 64-bit body ──┘
 //!                    1 = sha256(vpce-id) truncated
 //!                    4 = 4via6, client IPv4 in the low 32 bits
