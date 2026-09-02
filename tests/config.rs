@@ -283,3 +283,17 @@ fn udp_goes_through_permits_so_scopes_could_never_be_silently_ignored() {
             .unwrap();
     assert!(!scoped.permits(b"", t));
 }
+
+#[test]
+fn duplicate_names_take_the_first_scope() {
+    // Envoy rejects duplicate domains at config load; we take first-wins rather
+    // than fail. Pinned so the behaviour is a decision, not an accident.
+    let a = ip("fd00:dead:beef:1::1");
+    let b = ip("fd00:dead:beef:4::1");
+    let c = config::parse(
+        r#"{"scopes":[{"sni":["dup.test"],"allow":["fd00:dead:beef:1::/64"]},{"sni":["dup.test"],"allow":["fd00:dead:beef:4::/64"]}]}"#,
+    )
+    .unwrap();
+    assert!(c.permits(b"dup.test", a));
+    assert!(!c.permits(b"dup.test", b));
+}

@@ -11,11 +11,11 @@ use std::sync::Arc;
 /// See tcp.rs.
 type Status = abi::envoy_dynamic_module_type_on_udp_listener_filter_status;
 
-pub struct FilterConfig {
+pub struct AuthConfig {
     pub cfg: Arc<config::Config>,
 }
 
-impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for FilterConfig {
+impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for AuthConfig {
     fn new_udp_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn UdpListenerFilter<ELF>> {
         Box::new(Filter {
             cfg: self.cfg.clone(),

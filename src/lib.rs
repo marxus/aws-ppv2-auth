@@ -1,10 +1,17 @@
 //! Envoy dynamic module: PROXY protocol v2 identity, for TCP and UDP.
 //!
-//! One shared object, two filters. Parser, synthesis and config are shared; only
-//! the last step differs:
+//! One shared object, two filters, chosen by `filter_name`:
 //!
-//!   TCP  set_remote_address  -> a SecurityPolicy matches downstream
-//!   UDP  in-filter allowlist -> nothing downstream can read an identity
+//!   ppv2   parse the PROXY header, synthesize, label the socket, drain
+//!   auth   establish identity, scope it by SNI, allow or close
+//!
+//!   tcp  -> [auth, ...]
+//!   udp  -> [auth, ...]
+//!   tls  -> [ppv2, tls_inspector, auth, ...]
+//!
+//! Deny by default at every one of them. TLS is the only case that needs both:
+//! `auth` reads the SNI, which exists only after tls_inspector, and tls_inspector
+//! cannot see a ClientHello until the header is drained.
 
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::sync::Arc;
@@ -65,7 +72,7 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
         return None;
     }
     let cfg = load(config_bytes, validate_auth)?;
-    Some(Box::new(udp::FilterConfig { cfg }))
+    Some(Box::new(udp::AuthConfig { cfg }))
 }
 
 /// The single place a config failure becomes a rejected listener. Envoy says
@@ -85,6 +92,11 @@ fn load(
 
 fn parse(bytes: &[u8]) -> Result<config::Config, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "filter_config is not valid UTF-8")?;
+    // Envoy passes an empty string when filter_config is absent; serde would then
+    // report "EOF while parsing a value", which is not a useful thing to read.
+    if text.trim().is_empty() {
+        return Err("filter_config is missing".into());
+    }
     config::parse(text)
 }
 

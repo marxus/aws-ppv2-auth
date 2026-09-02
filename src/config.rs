@@ -110,21 +110,24 @@ impl Config {
             return None;
         }
 
-        let find = |f: &dyn Fn(&Pattern) -> bool| {
-            scopes
+        for s in scopes {
+            if s.names
                 .iter()
-                .find(|s| s.names.iter().any(f))
-                .map(|s| &s.allow)
-        };
-
-        if let Some(set) = find(&|p| matches!(p, Pattern::Exact(e) if eq_fold(e, sni))) {
-            return Some(set);
+                .any(|p| matches!(p, Pattern::Exact(e) if eq_fold(e, sni)))
+            {
+                return Some(&s.allow);
+            }
         }
         let mut rest = sni;
         while let Some(i) = rest.iter().position(|&b| b == b'.') {
             rest = &rest[i + 1..];
-            if let Some(set) = find(&|p| matches!(p, Pattern::Suffix(s) if eq_fold(s, rest))) {
-                return Some(set);
+            for s in scopes {
+                if s.names
+                    .iter()
+                    .any(|p| matches!(p, Pattern::Suffix(x) if eq_fold(x, rest)))
+                {
+                    return Some(&s.allow);
+                }
             }
         }
         None

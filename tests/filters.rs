@@ -29,8 +29,8 @@ fn auth_config(text: &str) -> tcp::AuthConfig {
     }
 }
 
-fn udp_config(text: &str) -> udp::FilterConfig {
-    udp::FilterConfig {
+fn udp_config(text: &str) -> udp::AuthConfig {
+    udp::AuthConfig {
         cfg: Arc::new(config::parse(text).unwrap()),
     }
 }
