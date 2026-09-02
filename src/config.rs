@@ -25,9 +25,8 @@ pub struct Config {
     pub prefix: Option<identity::Prefix>,
     /// Used when there are no `sni` scopes.
     pub allow: cidr::Set,
-    /// Exact-matched hostnames in config order, each with its own list. Patterns are
-    /// stored ASCII-lowercased.
-    pub scopes: Vec<(String, cidr::Set)>,
+    /// Hostname scopes in config order, each with its own list.
+    pub scopes: Vec<(Pattern, cidr::Set)>,
     /// Drop anything without a PROXY header.
     pub require_ppv2: bool,
 }
@@ -40,23 +39,73 @@ impl Config {
     }
 
     /// The list this connection is judged against, or None if no scope claims it.
+    ///
+    /// Envoy's ServerNameMatcher order (domain_matcher.h:78-101): exact first, then
+    /// wildcards longest-suffix-first. The walk consumes through each dot, so the
+    /// loop variable IS the next candidate -- `a.b.foo.com` probes `b.foo.com`,
+    /// then `foo.com`, then `com`.
     fn allowlist_for(&self, sni: &[u8]) -> Option<&cidr::Set> {
         if self.scopes.is_empty() {
             return Some(&self.allow);
         }
-        // Exact match, and no allocation: patterns are already lowercased and Envoy
-        // lowercases requestedServerName, but fold again rather than trust it.
-        self.scopes
-            .iter()
-            .find(|(pat, _)| {
-                pat.len() == sni.len()
-                    && pat
-                        .bytes()
-                        .zip(sni.iter())
-                        .all(|(p, s)| p == s.to_ascii_lowercase())
-            })
-            .map(|(_, set)| set)
+        // Empty SNI claims nothing, per domain_matcher.h:74-76.
+        if sni.is_empty() {
+            return None;
+        }
+
+        if let Some(set) = self.find(|p| matches!(p, Pattern::Exact(e) if eq_fold(e, sni))) {
+            return Some(set);
+        }
+        let mut rest = sni;
+        while let Some(i) = rest.iter().position(|&b| b == b'.') {
+            rest = &rest[i + 1..];
+            if let Some(set) = self.find(|p| matches!(p, Pattern::Suffix(s) if eq_fold(s, rest))) {
+                return Some(set);
+            }
+        }
+        None
     }
+
+    fn find(&self, f: impl Fn(&Pattern) -> bool) -> Option<&cidr::Set> {
+        self.scopes.iter().find(|(p, _)| f(p)).map(|(_, set)| set)
+    }
+}
+
+/// A `sni` pattern, stored ASCII-lowercased.
+///
+/// `Suffix` holds the hostname with `*.` already stripped, so `*.foo.com` becomes
+/// `Suffix("foo.com")` -- the shape domain_matcher.h:264-267 uses.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pattern {
+    Exact(String),
+    Suffix(String),
+}
+
+impl Pattern {
+    fn parse(text: &str) -> Pattern {
+        let lower = text.to_ascii_lowercase();
+        // Only a whole leading `*.` is a wildcard (domain_matcher.h:225). Anything
+        // else -- `foo.*`, `*bla.com` -- stays Exact, so it never matches a real SNI
+        // rather than failing the config. Erring toward deny, not toward allow.
+        match lower.strip_prefix("*.") {
+            Some(rest) if !rest.is_empty() => Pattern::Suffix(rest.to_string()),
+            _ => Pattern::Exact(lower),
+        }
+    }
+}
+
+/// Compare a lowercased pattern against raw SNI bytes, folding as we go.
+///
+/// The fold on the pattern side happens once at parse. Envoy's own domain_matcher
+/// never folds its config, so a config written `L7.Mgmt.Test` silently never
+/// matches there -- the SNI always arrives lowercased from the socket. We fold both
+/// sides. SNI is ASCII by spec, so this needs no allocation and no UTF-8 check.
+fn eq_fold(pat: &str, sni: &[u8]) -> bool {
+    pat.len() == sni.len()
+        && pat
+            .bytes()
+            .zip(sni.iter())
+            .all(|(p, s)| p == s.to_ascii_lowercase())
 }
 
 pub fn parse(text: &str) -> Result<Config, &'static str> {
@@ -64,7 +113,7 @@ pub fn parse(text: &str) -> Result<Config, &'static str> {
     let mut require_ppv2 = true;
     let mut flat: Vec<&str> = Vec::new();
     // The open scope is the last entry, so `allow` appends to it.
-    let mut scopes: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut scopes: Vec<(Pattern, Vec<&str>)> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -77,7 +126,7 @@ pub fn parse(text: &str) -> Result<Config, &'static str> {
         };
         match key {
             "ula" => prefix = Some(identity::parse_prefix(val)?),
-            "sni" => scopes.push((val.to_ascii_lowercase(), Vec::new())),
+            "sni" => scopes.push((Pattern::parse(val), Vec::new())),
             "allow" => match scopes.last_mut() {
                 Some((_, lines)) => lines.push(val),
                 None => flat.push(val),

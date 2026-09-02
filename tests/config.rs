@@ -1,5 +1,6 @@
 //! filter_config parsing, and the fail-closed choices that depend on it.
 
+use aws_ppv2_identity::config::Pattern;
 use aws_ppv2_identity::{config, identity};
 
 #[test]
@@ -94,9 +95,9 @@ fn sni_opens_a_scope_and_allow_lines_join_it() {
     // The bare `allow` before any `sni` is the flat list, not part of a scope.
     assert_eq!(c.allow.len(), 1);
     assert_eq!(c.scopes.len(), 2);
-    assert_eq!(c.scopes[0].0, "l7.mgmt.test");
+    assert_eq!(c.scopes[0].0, Pattern::Exact("l7.mgmt.test".into()));
     assert_eq!(c.scopes[0].1.len(), 1);
-    assert_eq!(c.scopes[1].0, "tcp.mgmt.test");
+    assert_eq!(c.scopes[1].0, Pattern::Exact("tcp.mgmt.test".into()));
     // The same identity may appear under several hostnames.
     assert_eq!(c.scopes[1].1.len(), 2);
 }
@@ -186,4 +187,109 @@ fn a_ula_with_bits_below_slash_48_is_rejected() {
     // every synthesized address would sit outside the rules written for it.
     assert!(config::parse("ula fd00:dead:beef:1234::/48\n").is_err());
     assert!(config::parse("ula fd00:dead:beef::1/48\n").is_err());
+}
+
+// --- ServerNameMatcher semantics (domain_matcher.h) -------------------------
+
+#[test]
+fn a_wildcard_is_stored_with_the_star_dot_stripped() {
+    let c = config::parse("sni *.pass.mgmt.test\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert_eq!(c.scopes[0].0, Pattern::Suffix("pass.mgmt.test".into()));
+}
+
+#[test]
+fn a_wildcard_matches_one_label_and_more_but_never_the_parent() {
+    let t = ip("fd00:dead:beef:1::1");
+    let c = config::parse("sni *.pass.mgmt.test\nallow fd00:dead:beef:1::/64\n").unwrap();
+
+    assert!(c.permits(b"a.pass.mgmt.test", t));
+    // Plain suffix match, not RFC 6125: deeper names match too.
+    assert!(c.permits(b"a.b.pass.mgmt.test", t));
+    // But the wildcard never matches its own parent.
+    assert!(!c.permits(b"pass.mgmt.test", t));
+    assert!(!c.permits(b"mgmt.test", t));
+    // And it is a LABEL boundary, not a character suffix -- unlike route domains,
+    // which would match this via `*bla.com`-style partial wildcards.
+    assert!(!c.permits(b"evilpass.mgmt.test", t));
+}
+
+#[test]
+fn exact_beats_wildcard_regardless_of_config_order() {
+    let broad = ip("fd00:dead:beef:4::1");
+    let narrow = ip("fd00:dead:beef:1::1");
+
+    // Wildcard declared FIRST, exact second.
+    let c = config::parse(
+        "sni   *.mgmt.test\n\
+         allow fd00:dead:beef:4::/64\n\
+         sni   l7.mgmt.test\n\
+         allow fd00:dead:beef:1::/64\n",
+    )
+    .unwrap();
+    assert!(c.permits(b"l7.mgmt.test", narrow));
+    assert!(!c.permits(b"l7.mgmt.test", broad)); // the exact scope, not the wildcard
+    assert!(c.permits(b"other.mgmt.test", broad)); // falls to the wildcard
+
+    // Same config, order reversed. Precedence must not change.
+    let c = config::parse(
+        "sni   l7.mgmt.test\n\
+         allow fd00:dead:beef:1::/64\n\
+         sni   *.mgmt.test\n\
+         allow fd00:dead:beef:4::/64\n",
+    )
+    .unwrap();
+    assert!(c.permits(b"l7.mgmt.test", narrow));
+    assert!(!c.permits(b"l7.mgmt.test", broad));
+    assert!(c.permits(b"other.mgmt.test", broad));
+}
+
+#[test]
+fn wildcards_are_tried_longest_suffix_first() {
+    let deep = ip("fd00:dead:beef:1::1");
+    let shallow = ip("fd00:dead:beef:4::1");
+    let c = config::parse(
+        "sni   *.test\n\
+         allow fd00:dead:beef:4::/64\n\
+         sni   *.mgmt.test\n\
+         allow fd00:dead:beef:1::/64\n",
+    )
+    .unwrap();
+
+    // `a.mgmt.test` probes `mgmt.test` before `test`, so the deeper scope wins even
+    // though the shallower one is declared first.
+    assert!(c.permits(b"a.mgmt.test", deep));
+    assert!(!c.permits(b"a.mgmt.test", shallow));
+    // Nothing deeper claims this one.
+    assert!(c.permits(b"a.other.test", shallow));
+}
+
+#[test]
+fn the_config_side_is_case_folded_too() {
+    // domain_matcher.h never folds its config, so a pattern written in mixed case
+    // silently never matches there -- the SNI always arrives lowercased. We fold
+    // both sides, so this works.
+    let t = ip("fd00:dead:beef:1::1");
+    let c = config::parse("sni L7.MGMT.Test\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert_eq!(c.scopes[0].0, Pattern::Exact("l7.mgmt.test".into()));
+    assert!(c.permits(b"l7.mgmt.test", t));
+    assert!(c.permits(b"L7.Mgmt.TEST", t));
+
+    let c = config::parse("sni *.PASS.Mgmt.TEST\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert_eq!(c.scopes[0].0, Pattern::Suffix("pass.mgmt.test".into()));
+    assert!(c.permits(b"A.Pass.MGMT.test", t));
+}
+
+#[test]
+fn a_partial_wildcard_is_not_a_wildcard() {
+    // Envoy rejects these at config load; we keep them as exact strings so they
+    // simply never match, which errs toward deny rather than failing the config.
+    let t = ip("fd00:dead:beef:1::1");
+    let c = config::parse("sni *bla.mgmt.test\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert_eq!(c.scopes[0].0, Pattern::Exact("*bla.mgmt.test".into()));
+    assert!(!c.permits(b"blabla.mgmt.test", t));
+    assert!(!c.permits(b"bla.mgmt.test", t));
+
+    let c = config::parse("sni mgmt.*\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert_eq!(c.scopes[0].0, Pattern::Exact("mgmt.*".into()));
+    assert!(!c.permits(b"mgmt.test", t));
 }

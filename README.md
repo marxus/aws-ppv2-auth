@@ -117,8 +117,21 @@ empty list denies everything. There is no `enforce` flag because deriving one fr
 so is an identity the matched block does not cover. An unmatched SNI does *not* fall
 back to the flat list — that would silently widen every scoped listener.
 
-SNI matching is **exact** and case-insensitive. A `*` in a pattern is not an error,
-it is simply a string that will not match anything.
+SNI matching follows Envoy's `ServerNameMatcher`
+(`source/extensions/common/matcher/domain_matcher.h`):
+
+- **exact wins** over any wildcard, whatever the config order
+- **wildcards are tried longest-suffix-first** — `a.mgmt.test` probes `*.mgmt.test`
+  before `*.test`
+- **`*.foo.com` does not match `foo.com`** — the wildcard needs a label in front
+- **`*.foo.com` does match `a.b.foo.com`** — a label-boundary suffix match, not the
+  single-label rule TLS certificates use
+- **ASCII case-insensitive on both sides.** Envoy folds only the SNI, so a pattern
+  written `L7.Mgmt.Test` never matches there; we fold the config too.
+
+Only a whole leading `*.` is a wildcard. `foo.*` and `*bla.com` are kept as literal
+strings rather than rejected, so they never match a real SNI — erring toward deny
+rather than failing the config.
 
 Three combinations are rejected outright rather than documented as footguns:
 
