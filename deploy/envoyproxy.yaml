@@ -34,7 +34,7 @@ spec:
           volumes:
             - name: aws-ppv2-identity
               image:
-                reference: ghcr.io/marxus/aws-ppv2-identity:v0.2.0
+                reference: ghcr.io/marxus/aws-ppv2-identity:v0.3.0
                 pullPolicy: IfNotPresent
         container:
           volumeMounts:
