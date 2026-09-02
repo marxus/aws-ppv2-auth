@@ -42,20 +42,42 @@ fn typos_and_a_bad_ula_are_errors() {
 }
 
 #[test]
-fn ula_is_required_by_the_filters_that_synthesize_not_by_the_parser() {
-    // `auth` on a TLS chain has no `ula`: a preceding `ppv2` filter already
-    // labelled the socket, so there is nothing for it to synthesize.
-    let c = config::parse("allow fd00:dead:beef:1::/64\n").unwrap();
-    assert!(c.prefix.is_none());
-    assert!(aws_ppv2_identity::validate_auth(&c).is_ok());
+fn ula_and_sni_are_the_two_ways_auth_can_learn_an_identity() {
+    use aws_ppv2_identity::{validate_auth, validate_ppv2};
 
-    // A filter that must derive identity itself cannot do without it.
-    assert!(aws_ppv2_identity::validate_ppv2(&c).is_err());
-    assert!(aws_ppv2_identity::validate_udp_auth(&c).is_err());
+    // `ula`: parse the header here. This is the plain TCP and the UDP shape.
+    let c = config::parse("ula fd00:dead:beef::/48\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(validate_auth(&c).is_ok());
+
+    // `sni`: read the label a preceding `ppv2` filter left. The TLS shape.
+    let c = config::parse("sni a.test\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(c.prefix.is_none());
+    assert!(validate_auth(&c).is_ok());
+    assert!(validate_ppv2(&c).is_err()); // ppv2 still needs its ula
+
+    // Both is the contradiction "I run before tls_inspector and also after it".
+    let c = config::parse("ula fd00:dead:beef::/48\nsni a.test\nallow fd00:dead:beef:1::/64\n")
+        .unwrap();
+    assert!(validate_auth(&c).is_err());
+
+    // Neither leaves nothing to derive identity from.
+    let c = config::parse("allow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(validate_auth(&c).is_err());
 }
 
 #[test]
-fn ppv2_refuses_to_carry_rules_it_cannot_enforce() {
+fn auth_must_be_able_to_permit_something() {
+    // An `auth` filter with no `allow` anywhere denies every connection. That is a
+    // config mistake, not a policy -- fail the listener rather than the traffic.
+    let c = config::parse("ula fd00:dead:beef::/48\n").unwrap();
+    assert!(aws_ppv2_identity::validate_auth(&c).is_err());
+
+    let c = config::parse("sni a.test\n").unwrap();
+    assert!(aws_ppv2_identity::validate_auth(&c).is_err());
+}
+
+#[test]
+fn ppv2_takes_only_ula() {
     // It labels and drains; it never denies. An `allow` here would read as applied
     // and do nothing -- the same footgun `allow` on TCP used to be.
     let c = config::parse("ula fd00:dead:beef::/48\nallow fd00:dead:beef:1::/64\n").unwrap();
@@ -71,12 +93,14 @@ fn ppv2_refuses_to_carry_rules_it_cannot_enforce() {
 }
 
 #[test]
-fn sni_on_udp_is_an_error() {
-    // No TLS handshake on UDP, so the scope could never match and every datagram
-    // would be denied for a reason nobody could see.
-    let c = config::parse("ula fd00:dead:beef::/48\nsni a.test\nallow fd00:dead:beef:1::/64\n")
-        .unwrap();
-    assert!(aws_ppv2_identity::validate_udp_auth(&c).is_err());
+fn auth_has_one_rule_set_whatever_the_transport() {
+    // UDP and TCP `auth` are validated identically -- the filter never has to know
+    // which it is, because the distinction that matters is position in the chain,
+    // not transport. Both hooks call validate_auth.
+    let ula = config::parse("ula fd00:dead:beef::/48\nallow fd00:dead:beef:1::/64\n").unwrap();
+    let sni = config::parse("sni a.test\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(aws_ppv2_identity::validate_auth(&ula).is_ok());
+    assert!(aws_ppv2_identity::validate_auth(&sni).is_ok());
 }
 
 #[test]

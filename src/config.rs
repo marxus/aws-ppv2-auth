@@ -12,6 +12,11 @@
 //! `sni` opens a scope: every `allow` after it belongs to that hostname. An `allow`
 //! before any `sni` joins the flat list, which is what a listener without SNI uses.
 //!
+//! `ula` and `sni` are the two ways `auth` can learn an identity and are mutually
+//! exclusive -- see validate_auth in lib.rs. `ula` means it runs before
+//! tls_inspector and parses the header itself; `sni` means it runs after, and a
+//! `ppv2` filter already labelled the socket.
+//!
 //! Deny by default. No scope matches the SNI, or none covers the identity, and the
 //! connection is closed -- which is why there is no `enforce` flag: deriving one
 //! from "is the list non-empty" would make the safe state mean allow-any.

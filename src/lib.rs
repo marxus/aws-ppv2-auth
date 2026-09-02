@@ -59,11 +59,12 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
     if name != "auth" {
         // A UDP `ppv2` filter could not hand its identity anywhere: the UDP ABI has
-        // no filter state and no set_remote_address, so UDP is `auth` alone.
+        // no filter state and no set_remote_address, so UDP is `auth` alone. The
+        // config rules are otherwise identical -- see validate_auth.
         eprintln!("aws-ppv2-identity: UDP supports only filter_name auth, got {name:?}");
         return None;
     }
-    let cfg = load(config_bytes, validate_udp_auth)?;
+    let cfg = load(config_bytes, validate_auth)?;
     Some(Box::new(udp::FilterConfig { cfg }))
 }
 
@@ -87,31 +88,37 @@ fn parse(bytes: &[u8]) -> Result<config::Config, &'static str> {
     config::parse(text)
 }
 
-/// `ppv2` synthesizes, so it needs the prefix -- and it never enforces, so an
-/// allowlist here would be a security rule that reads as applied and does nothing.
+/// `ppv2` labels and drains, nothing else. It needs `ula` to synthesize, and an
+/// allowlist here would be a rule that reads as applied and does nothing.
 pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
     if cfg.prefix.is_none() {
         return Err("`ppv2` needs `ula` to synthesize an identity");
     }
     if !cfg.allow.is_empty() || !cfg.scopes.is_empty() {
-        return Err("`ppv2` does not enforce; put `allow` and `sni` on the `auth` filter");
+        return Err("`ppv2` takes only `ula`; put `allow` and `sni` on the `auth` filter");
     }
     Ok(())
 }
 
-/// `auth` takes identity either from its own PPv2 parse (`ula` present) or from the
-/// label a preceding `ppv2` filter wrote. Both are valid, so nothing to require.
-pub fn validate_auth(_cfg: &config::Config) -> Result<(), &'static str> {
-    Ok(())
-}
-
-/// UDP has no preceding filter to read a label from, so it must parse for itself.
-pub fn validate_udp_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.prefix.is_none() {
-        return Err("UDP `auth` needs `ula`: there is no preceding filter to label it");
+/// `auth` needs something to permit, and exactly one way to learn the identity.
+///
+/// The two are positional, not about transport -- which is why this is the same
+/// check for TCP and UDP, and why `auth` never has to know which it is:
+///
+///   `ula` -- I run BEFORE tls_inspector, so I parse the header myself.
+///   `sni` -- I run AFTER it, so a preceding `ppv2` filter already labelled the
+///            socket and the SNI exists to scope by.
+///
+/// Both at once is the contradiction "first and not first".
+pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
+    let permits_something =
+        !cfg.allow.is_empty() || cfg.scopes.iter().any(|(_, set)| !set.is_empty());
+    if !permits_something {
+        return Err("`auth` needs at least one `allow`, or it can never permit anything");
     }
-    if !cfg.scopes.is_empty() {
-        return Err("`sni` needs a TLS handshake; UDP has none");
+    match (cfg.prefix.is_some(), !cfg.scopes.is_empty()) {
+        (true, false) | (false, true) => Ok(()),
+        (true, true) => Err("`ula` and `sni` are mutually exclusive: `ula` means this filter runs before tls_inspector, so there is no SNI yet"),
+        (false, false) => Err("`auth` needs `ula` (parse the header here) or `sni` (read the label a `ppv2` filter left)"),
     }
-    Ok(())
 }

@@ -133,17 +133,25 @@ Only a whole leading `*.` is a wildcard. `foo.*` and `*bla.com` are kept as lite
 strings rather than rejected, so they never match a real SNI — erring toward deny
 rather than failing the config.
 
-Three combinations are rejected outright rather than documented as footguns:
+Each filter takes one config shape, and anything else fails the listener:
 
-- `allow` or `sni` on a **`ppv2`** config — it labels and drains, it never denies,
-  so the rule would read as applied and do nothing.
-- `sni` on a **UDP** config — there is no handshake to inspect, so the scope could
-  never match and every datagram would be denied for an invisible reason.
-- `require_ppv2 false` with a non-empty allowlist — unparsed headers yield no
-  address to match, so they would walk straight past it.
+| filter | config | meaning |
+|---|---|---|
+| `ppv2` | `ula` only | synthesize and label; it never denies, so it takes no rules |
+| `auth` | `ula` + `allow` | parse the header here — plain TCP, and UDP |
+| `auth` | `sni` + `allow` | read the label a `ppv2` filter left — the TLS chain |
 
-`ula` is required only by the filters that synthesize: `ppv2`, and `auth` when no
-`ppv2` precedes it. On a TLS chain `auth` has none and reads the label back instead.
+**`ula` and `sni` are mutually exclusive on `auth`, and the reason is positional
+rather than about transport**: `ula` means this filter runs *before*
+`tls_inspector`, so no SNI exists yet; `sni` means it runs *after*, so the socket
+is already labelled. Both at once is the contradiction "first and not first".
+
+That is why `auth` never needs to know whether it is on TCP or UDP — the same
+rules apply to both, and the same validator checks them.
+
+`auth` also needs at least one `allow`, or it could never permit anything; and
+`require_ppv2 false` with a non-empty allowlist is rejected, because unparsed
+headers yield no address to match and would walk straight past it.
 
 ## Why the two filters differ
 
