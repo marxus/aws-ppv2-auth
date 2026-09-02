@@ -7,8 +7,18 @@
 # ONE POLICY PER GATEWAY. A second EnvoyPatchPolicy targeting the same Gateway is
 # silently ignored -- no status conditions, no error. Merge all patches here.
 #
-# path: /listener_filters/0 -- the module must run BEFORE udp_proxy, and JSON
-# Patch `add` at index 0 inserts and shifts.
+# The chain shapes, and why they differ:
+#
+#   tcp  -> [auth, ...]
+#   udp  -> [auth, ...]
+#   tls  -> [ppv2, tls_inspector, auth, ...]
+#
+# TLS is the special case. `auth` needs the SNI, which only exists after
+# tls_inspector has run, and tls_inspector cannot find a ClientHello until the
+# PROXY header is drained -- so `ppv2` splits off to the front to drain it.
+#
+# JSON Patch `add` at /listener_filters/0 inserts and shifts, so the patches for a
+# multi-filter chain are listed in REVERSE: the last one added ends up first.
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyPatchPolicy
 metadata:
@@ -21,46 +31,83 @@ spec:
     name: gw
   type: JSONPatch
   jsonPatches:
-    # --- TCP / TLS listeners: label the connection, then let policy match it ---
+    # --- TLS listener: [ppv2, tls_inspector, auth] ---------------------------
     #
-    # Do NOT also enable Envoy's own proxy_protocol filter on these listeners
+    # Do NOT also enable Envoy's own proxy_protocol filter on this listener
     # (ClientTrafficPolicy.enableProxyProtocol). Only one of the two can drain
     # the header.
+    #
+    # Added third, so it ends up last. `auth` has no `ula`: `ppv2` already put the
+    # synthesized identity on the socket and this reads it back.
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: envoy-gateway-system/gw/https
       operation:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2-identity
+          name: aws-ppv2-identity-auth
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.dynamic_modules.v3.DynamicModuleListenerFilter
             dynamic_module_config: { name: aws-ppv2-identity }
-            filter_name: aws-ppv2-identity
+            filter_name: auth
+            filter_config:
+              "@type": type.googleapis.com/google.protobuf.StringValue
+              # Deny by default: an SNI no `sni` block claims is refused, and so is
+              # an identity the matched block does not cover. Matching is exact.
+              value: |
+                sni   l7.mgmt.test
+                allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+                sni   tcp.mgmt.test
+                allow fd00:dead:beef:4::a01:0/112
+                allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+
+    # Added second, ends up in the middle. Without this the SNI is always empty and
+    # every connection is denied -- fail-closed, but check here first if that.
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: envoy-gateway-system/gw/https
+      operation:
+        op: add
+        path: /listener_filters/0
+        value:
+          name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+
+    # Added last, ends up first: drain the header before tls_inspector looks.
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: envoy-gateway-system/gw/https
+      operation:
+        op: add
+        path: /listener_filters/0
+        value:
+          name: aws-ppv2-identity-ppv2
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.dynamic_modules.v3.DynamicModuleListenerFilter
+            dynamic_module_config: { name: aws-ppv2-identity }
+            filter_name: ppv2
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
               # Generate your own /48 once, per RFC 4193: fd + 40 random bits.
+              # `ppv2` never enforces, so it rejects `allow` and `sni` outright.
               value: |
                 ula fd00:dead:beef::/48
 
-    # --- UDP listeners: the filter enforces, because nothing downstream can ---
+    # --- UDP listener: [auth] ------------------------------------------------
     #
-    # udp_proxy has no RBAC filter and the UDP ABI cannot attach an identity to a
-    # session, so a SecurityPolicy has nothing to match. The allowlist below is
-    # the only enforcement point on this path.
-    #
-    # ALLOWLIST ONLY, like a security group: an empty list denies everything.
+    # No handshake to inspect and no way to hand an identity between UDP filters --
+    # the ABI has no filter state and no set_remote_address -- so `auth` does the
+    # whole job here and `sni` is a config error.
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: envoy-gateway-system/gw/dns
       operation:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2-identity
+          name: aws-ppv2-identity-auth
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.udp.dynamic_modules.v3.DynamicModuleUdpListenerFilter
             dynamic_module_config: { name: aws-ppv2-identity }
-            filter_name: aws-ppv2-identity
+            filter_name: auth
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
               value: |

@@ -4,8 +4,19 @@ An Envoy dynamic module that turns AWS PROXY protocol v2 identity into an
 **IPv6 address**, so ordinary `clientCIDRs` rules can express PrivateLink tenant
 identity at both L4 and L7.
 
-    envoy.filters.listener.dynamic_modules       TCP  -> set_remote_address
-    envoy.filters.udp_listener.dynamic_modules   UDP  -> enforce in-filter
+Two filters ship in one `.so`, chosen by `filter_name`:
+
+    ppv2   parse the PROXY header, synthesize, label the socket, drain
+    auth   establish identity, scope it by SNI, allow or close
+
+    tcp  -> [auth, ...]
+    udp  -> [auth, ...]
+    tls  -> [ppv2, tls_inspector, auth, ...]
+
+TLS is the special case. `auth` needs the SNI, which exists only after
+`tls_inspector` runs, and `tls_inspector` cannot find a ClientHello until the PROXY
+header is drained — so `ppv2` splits off to the front. Everywhere else `auth` does
+the whole job itself.
 
 ## The idea
 
@@ -41,8 +52,14 @@ spoofing concern and nothing for a CNI's source-IP verification to reject.
 
 ## What it buys
 
-The rewrite happens before any RBAC filter, so the same rules work at both
-layers:
+Deny by default at the very first thing traffic reaches after the NLB, before a
+filter chain is even selected — and identity scoped per hostname, which nothing at
+L4 could express before. `clientCIDRs` is the *only* principal a `TCPRoute`
+supports, and CEL is rejected outright.
+
+The label is still written with `set_remote_address` before any RBAC filter runs, so
+a `SecurityPolicy` can match the same identity downstream if you want defence in
+depth:
 
 ```yaml
 principal:
@@ -50,10 +67,6 @@ principal:
     - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128   # one tenant
     - fd00:dead:beef:4::12c7:0/112               # 18.199.0.0/16
 ```
-
-No header injection, no CEL. `clientCIDRs` is the *only* principal a `TCPRoute`
-supports — CEL is rejected outright — so L4 had no tenant identity before this.
-An L4 denial drops the connection; L7 returns 403.
 
 ## Install
 
@@ -81,31 +94,51 @@ A `google.protobuf.StringValue` in `filter_config`, line-oriented so a
 
 ```text
 ula   fd00:dead:beef::/48
+sni   l7.mgmt.test
 allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
-allow 2001:db8:10da:7800::/56
+sni   tcp.mgmt.test
+allow fd00:dead:beef:4::a01:0/112
+allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
 ```
+
+`sni` opens a scope: every `allow` after it belongs to that hostname, and the same
+identity may appear under several. An `allow` before any `sni` joins the flat list,
+which is what a listener with no SNI uses.
 
 Generate your own `ula` once per RFC 4193: `fd` plus 40 random bits, nothing set
 below the /48. Unknown keys are an error, and `require_ppv2` takes only `true` or
 `false` — a typo fails the config rather than silently disabling enforcement.
 
-`allow` is **UDP-only** and **allowlist-only, like a security group**: permitted
-iff some line covers it, so an empty list denies everything. There is no
-`enforce` flag because deriving one from "is the list non-empty" would make the
-single safe state mean allow-any.
+**Allowlist-only, like a security group**: permitted iff some line covers it, so an
+empty list denies everything. There is no `enforce` flag because deriving one from
+"is the list non-empty" would make the single safe state mean allow-any.
 
-Two combinations are rejected outright rather than documented as footguns:
+**Deny by default, twice over.** An SNI that no `sni` block claims is refused, and
+so is an identity the matched block does not cover. An unmatched SNI does *not* fall
+back to the flat list — that would silently widen every scoped listener.
 
-- `allow` on a **TCP** config — the TCP filter has no enforcement point, so the
-  rule would read as applied and do nothing. Use a `SecurityPolicy`.
-- `require_ppv2 false` with a non-empty `allow` — unparsed headers yield no
-  address to match, so they would walk straight past the allowlist.
+SNI matching is **exact** and case-insensitive. A `*` in a pattern is not an error,
+it is simply a string that will not match anything.
+
+Three combinations are rejected outright rather than documented as footguns:
+
+- `allow` or `sni` on a **`ppv2`** config — it labels and drains, it never denies,
+  so the rule would read as applied and do nothing.
+- `sni` on a **UDP** config — there is no handshake to inspect, so the scope could
+  never match and every datagram would be denied for an invisible reason.
+- `require_ppv2 false` with a non-empty allowlist — unparsed headers yield no
+  address to match, so they would walk straight past it.
+
+`ula` is required only by the filters that synthesize: `ppv2`, and `auth` when no
+`ppv2` precedes it. On a TLS chain `auth` has none and reads the label back instead.
 
 ## Why the two filters differ
 
 The UDP ABI has 21 callbacks but none can attach an identity to a session, and
 `udp_proxy` has no RBAC filter — so nothing downstream can read one. Enforcement
-happens in the filter or nowhere.
+happens in the filter or nowhere. That same gap is why UDP cannot split into
+`[ppv2, auth]`: there is no filter state and no `set_remote_address`, so a UDP
+`ppv2` filter would have nowhere to put what it derived.
 
 The gap is one missing extension point upstream: a UDP *session* filter can write
 filter state and `tunneling_config` reads `%FILTER_STATE(key)%`, but there is no
@@ -124,6 +157,10 @@ read, a TLV claiming a length past the end stops the walk, and a header declarin
 more than 256 bytes is rejected rather than buffered.
 
 ## Security
+
+**A missing `tls_inspector` denies everything.** On a TLS chain `auth` reads the SNI
+from the socket, and without that filter it is always empty, so no scope matches.
+Fail-closed, but check the chain order first if a listener refuses everything.
 
 **The module must be the only PPv2 speaker on its listeners.** Anything that can
 reach one directly can claim any address and have it adopted — the same class of

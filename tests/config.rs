@@ -12,7 +12,7 @@ fn parses_a_typical_config() {
          allow fd00:dead:beef:4::12c7:0/112\n",
     )
     .unwrap();
-    assert_eq!(c.prefix, [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(c.prefix, Some([0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef]));
     assert_eq!(c.allow.len(), 2);
     assert!(c.require_ppv2);
 }
@@ -35,10 +35,122 @@ fn an_empty_allow_list_denies_everything_it_does_not_disable_enforcement() {
 }
 
 #[test]
-fn typos_and_a_missing_ula_are_errors() {
+fn typos_and_a_bad_ula_are_errors() {
     assert!(config::parse("ula fd2a::/48\nallwo x\n").is_err());
-    assert!(config::parse("allow fd00::/8\n").is_err()); // no ula
     assert!(config::parse("ula 2001:db8::/48\n").is_err()); // not a ULA
+}
+
+#[test]
+fn ula_is_required_by_the_filters_that_synthesize_not_by_the_parser() {
+    // `auth` on a TLS chain has no `ula`: a preceding `ppv2` filter already
+    // labelled the socket, so there is nothing for it to synthesize.
+    let c = config::parse("allow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(c.prefix.is_none());
+    assert!(aws_ppv2_identity::validate_auth(&c).is_ok());
+
+    // A filter that must derive identity itself cannot do without it.
+    assert!(aws_ppv2_identity::validate_ppv2(&c).is_err());
+    assert!(aws_ppv2_identity::validate_udp_auth(&c).is_err());
+}
+
+#[test]
+fn ppv2_refuses_to_carry_rules_it_cannot_enforce() {
+    // It labels and drains; it never denies. An `allow` here would read as applied
+    // and do nothing -- the same footgun `allow` on TCP used to be.
+    let c = config::parse("ula fd00:dead:beef::/48\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(aws_ppv2_identity::validate_ppv2(&c).is_err());
+
+    let c = config::parse("ula fd00:dead:beef::/48\nsni a.test\nallow fd00:dead:beef:1::/64\n")
+        .unwrap();
+    assert!(aws_ppv2_identity::validate_ppv2(&c).is_err());
+
+    // Bare, it is exactly what a ppv2 filter should be.
+    let c = config::parse("ula fd00:dead:beef::/48\n").unwrap();
+    assert!(aws_ppv2_identity::validate_ppv2(&c).is_ok());
+}
+
+#[test]
+fn sni_on_udp_is_an_error() {
+    // No TLS handshake on UDP, so the scope could never match and every datagram
+    // would be denied for a reason nobody could see.
+    let c = config::parse("ula fd00:dead:beef::/48\nsni a.test\nallow fd00:dead:beef:1::/64\n")
+        .unwrap();
+    assert!(aws_ppv2_identity::validate_udp_auth(&c).is_err());
+}
+
+#[test]
+fn sni_opens_a_scope_and_allow_lines_join_it() {
+    let c = config::parse(
+        "ula   fd00:dead:beef::/48\n\
+         allow fd00:dead:beef:9::/64\n\
+         sni   l7.mgmt.test\n\
+         allow fd00:dead:beef:1::/64\n\
+         sni   tcp.mgmt.test\n\
+         allow fd00:dead:beef:4::a01:0/112\n\
+         allow fd00:dead:beef:1::/64\n",
+    )
+    .unwrap();
+
+    // The bare `allow` before any `sni` is the flat list, not part of a scope.
+    assert_eq!(c.allow.len(), 1);
+    assert_eq!(c.scopes.len(), 2);
+    assert_eq!(c.scopes[0].0, "l7.mgmt.test");
+    assert_eq!(c.scopes[0].1.len(), 1);
+    assert_eq!(c.scopes[1].0, "tcp.mgmt.test");
+    // The same identity may appear under several hostnames.
+    assert_eq!(c.scopes[1].1.len(), 2);
+}
+
+#[test]
+fn scopes_are_matched_exactly_and_deny_by_default() {
+    let tenant = ip("fd00:dead:beef:1::1");
+    let other = ip("fd00:dead:beef:9::1");
+    let c = config::parse(
+        "ula   fd00:dead:beef::/48\n\
+         sni   l7.mgmt.test\n\
+         allow fd00:dead:beef:1::/64\n",
+    )
+    .unwrap();
+
+    assert!(c.permits(b"l7.mgmt.test", tenant));
+    assert!(c.permits(b"L7.MGMT.TEST", tenant)); // SNI is case-insensitive
+    assert!(!c.permits(b"l7.mgmt.test", other)); // matched, but not on the list
+    assert!(!c.permits(b"other.mgmt.test", tenant)); // no scope claims it
+    assert!(!c.permits(b"", tenant)); // no SNI at all
+    assert!(!c.permits(b"l7.mgmt.test.", tenant)); // exact means exact
+}
+
+#[test]
+fn an_unmatched_sni_does_not_fall_back_to_the_flat_list() {
+    // The distinguishing case. The flat list covers this tenant, and a scope exists
+    // for a different hostname. An SNI matching no scope must still be denied --
+    // falling back would silently widen every scoped listener to the flat list.
+    let tenant = ip("fd00:dead:beef:1::1");
+    let c = config::parse(
+        "ula   fd00:dead:beef::/48\n\
+         allow fd00:dead:beef:1::/64\n\
+         sni   l7.mgmt.test\n\
+         allow fd00:dead:beef:1::/64\n",
+    )
+    .unwrap();
+
+    assert!(!c.allow.is_empty()); // the flat list really would admit it
+    assert!(c.permits(b"l7.mgmt.test", tenant));
+    assert!(!c.permits(b"other.mgmt.test", tenant));
+    assert!(!c.permits(b"", tenant));
+}
+
+#[test]
+fn without_scopes_the_flat_list_applies_whatever_the_sni() {
+    let tenant = ip("fd00:dead:beef:1::1");
+    let c = config::parse("ula fd00:dead:beef::/48\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(c.permits(b"", tenant));
+    assert!(c.permits(b"anything.test", tenant));
+    assert!(!c.permits(b"anything.test", ip("fd00:dead:beef:9::1")));
+}
+
+fn ip(s: &str) -> u128 {
+    identity::to_u128(s.parse::<std::net::Ipv6Addr>().unwrap().octets())
 }
 
 #[test]

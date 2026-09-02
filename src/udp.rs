@@ -40,6 +40,10 @@ enum Decision {
 
 impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
     fn on_data(&mut self, envoy: &mut ELF) -> Status {
+        // Unreachable: lib.rs rejects a UDP config without `ula`. Deny anyway.
+        let Some(prefix) = self.cfg.prefix else {
+            return Status::StopIteration;
+        };
         // Several chunks are possible; the single-chunk case -- every real NLB
         // datagram -- borrows in place and costs no allocation.
         let decision = {
@@ -63,7 +67,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
             match ppv2::parse(buf) {
                 Err(ppv2::Error::Need(_)) => Decision::NotProxyProtocol,
                 Ok(h) => {
-                    let addr = identity::synthesize(self.cfg.prefix, &h);
+                    let addr = identity::synthesize(prefix, &h);
                     if self.cfg.allow.contains(identity::to_u128(addr)) {
                         self.payload.clear();
                         self.payload.extend_from_slice(&buf[h.len..]);
