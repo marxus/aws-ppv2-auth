@@ -15,7 +15,7 @@ use abi::envoy_dynamic_module_type_on_udp_listener_filter_status as UdpStatus;
 
 const ULA: &str = "ula fd00:dead:beef::/48\n";
 /// sha256("vpce-0123456789abcdef0")[..8] -- see tests/identity.rs.
-const TENANT: &str = "allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128\n";
+const TENANT: &str = ":allow:\nfd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128\n";
 
 fn ppv2_config(text: &str) -> tcp::Ppv2Config {
     tcp::Ppv2Config {
@@ -239,7 +239,7 @@ fn labelled(addr: &'static str, sni: &'static [u8]) -> MockEnvoyListenerFilter {
     envoy
 }
 
-const SCOPED: &str = "sni l7.mgmt.test\nallow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128\n";
+const SCOPED: &str = ":sni:\nl7.mgmt.test\n:allow:\nfd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128\n";
 
 #[test]
 fn auth_admits_a_listed_identity_on_a_matching_sni() {

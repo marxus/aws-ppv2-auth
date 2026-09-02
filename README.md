@@ -92,18 +92,24 @@ manifest list, so the kubelet resolves the architecture.
 A `google.protobuf.StringValue` in `filter_config`, line-oriented so a
 `kubectl diff` of 10,000 entries stays readable:
 
+Scalars are `key value`. Lists are sections — `:name:` on its own line, then one
+item per line until the next section:
+
 ```text
-ula   fd00:dead:beef::/48
-sni   l7.mgmt.test
-allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
-sni   tcp.mgmt.test
-allow fd00:dead:beef:4::a01:0/112
-allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+ula fd00:dead:beef::/48
+
+:sni:
+l7.mgmt.test
+*.pass.mgmt.test
+:allow:
+fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+fd00:dead:beef:4::a01:0/112
 ```
 
-`sni` opens a scope: every `allow` after it belongs to that hostname, and the same
-identity may appear under several. An `allow` before any `sni` joins the flat list,
-which is what a listener with no SNI uses.
+A `:sni:` section opens a scope and may name **several hostnames**, which then
+share the `:allow:` that follows — the shape Envoy's `ServerNameMatcher` uses,
+where one `domains` list maps to one action. An `:allow:` before any `:sni:` is
+the flat list, which is what a listener with no SNI uses.
 
 Generate your own `ula` once per RFC 4193: `fd` plus 40 random bits, nothing set
 below the /48. Unknown keys are an error, and `require_ppv2` takes only `true` or
@@ -138,8 +144,8 @@ Each filter takes one config shape, and anything else fails the listener:
 | filter | config | meaning |
 |---|---|---|
 | `ppv2` | `ula` only | synthesize and label; it never denies, so it takes no rules |
-| `auth` | `ula` + `allow` | parse the header here — plain TCP, and UDP |
-| `auth` | `sni` + `allow` | read the label a `ppv2` filter left — the TLS chain |
+| `auth` | `ula` + `:allow:` | parse the header here — plain TCP, and UDP |
+| `auth` | `:sni:` + `:allow:` | read the label a `ppv2` filter left — the TLS chain |
 
 **`ula` and `sni` are mutually exclusive on `auth`, and the reason is positional
 rather than about transport**: `ula` means this filter runs *before*

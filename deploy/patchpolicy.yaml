@@ -52,14 +52,20 @@ spec:
             filter_name: auth
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
-              # Deny by default: an SNI no `sni` block claims is refused, and so is
-              # an identity the matched block does not cover. Matching is exact.
+              # Deny by default: an SNI no `:sni:` block claims is refused, and so
+              # is an identity the matched block does not cover. A `:sni:` block may
+              # name several hostnames, which then share the `:allow:` below it.
               value: |
-                sni   l7.mgmt.test
-                allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
-                sni   tcp.mgmt.test
-                allow fd00:dead:beef:4::a01:0/112
-                allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+                :sni:
+                l7.mgmt.test
+                *.pass.mgmt.test
+                :allow:
+                fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+                :sni:
+                tcp.mgmt.test
+                :allow:
+                fd00:dead:beef:4::a01:0/112
+                fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
 
     # Added second, ends up in the middle. Without this the SNI is always empty and
     # every connection is denied -- fail-closed, but check here first if that.
@@ -88,15 +94,15 @@ spec:
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
               # Generate your own /48 once, per RFC 4193: fd + 40 random bits.
-              # `ppv2` never enforces, so it rejects `allow` and `sni` outright.
+              # `ppv2` never enforces, so it takes `ula` and nothing else.
               value: |
                 ula fd00:dead:beef::/48
 
     # --- UDP listener: [auth] ------------------------------------------------
     #
-    # No handshake to inspect and no way to hand an identity between UDP filters --
-    # the ABI has no filter state and no set_remote_address -- so `auth` does the
-    # whole job here and `sni` is a config error.
+    # No way to hand an identity between UDP filters -- the ABI has no filter state
+    # and no set_remote_address -- so `auth` does the whole job here, with `ula`.
+    # Same config rules as TCP; the filter never asks which transport it is on.
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: envoy-gateway-system/gw/dns
       operation:
@@ -111,5 +117,6 @@ spec:
             filter_config:
               "@type": type.googleapis.com/google.protobuf.StringValue
               value: |
-                ula   fd00:dead:beef::/48
-                allow fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+                ula fd00:dead:beef::/48
+                :allow:
+                fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
