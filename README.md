@@ -149,9 +149,10 @@ is already labelled. Both at once is the contradiction "first and not first".
 That is why `auth` never needs to know whether it is on TCP or UDP — the same
 rules apply to both, and the same validator checks them.
 
-`auth` also needs at least one `allow`, or it could never permit anything; and
-`require_ppv2 false` with a non-empty allowlist is rejected, because unparsed
-headers yield no address to match and would walk straight past it.
+An `auth` filter with no `allow` at all is valid and denies everything — an empty
+allowlist is deny-all, the same as an empty security group. `require_ppv2 false`
+with a non-empty allowlist is rejected, because unparsed headers yield no address
+to match and would walk straight past it.
 
 ## Why the two filters differ
 

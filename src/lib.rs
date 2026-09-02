@@ -100,7 +100,7 @@ pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// `auth` needs something to permit, and exactly one way to learn the identity.
+/// `auth` needs exactly one way to learn the identity.
 ///
 /// The two are positional, not about transport -- which is why this is the same
 /// check for TCP and UDP, and why `auth` never has to know which it is:
@@ -111,11 +111,10 @@ pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
 ///
 /// Both at once is the contradiction "first and not first".
 pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    let permits_something =
-        !cfg.allow.is_empty() || cfg.scopes.iter().any(|(_, set)| !set.is_empty());
-    if !permits_something {
-        return Err("`auth` needs at least one `allow`, or it can never permit anything");
-    }
+    // No `allow` is not an error: an empty allowlist denies everything, exactly as
+    // an empty security group does. Rejecting it would make "is the list non-empty"
+    // load-bearing -- the thing config.rs refuses to do for the same reason -- and
+    // would take the listener down when you comment out the last rule to debug.
     match (cfg.prefix.is_some(), !cfg.scopes.is_empty()) {
         (true, false) | (false, true) => Ok(()),
         (true, true) => Err("`ula` and `sni` are mutually exclusive: `ula` means this filter runs before tls_inspector, so there is no SNI yet"),

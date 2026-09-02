@@ -66,14 +66,20 @@ fn ula_and_sni_are_the_two_ways_auth_can_learn_an_identity() {
 }
 
 #[test]
-fn auth_must_be_able_to_permit_something() {
-    // An `auth` filter with no `allow` anywhere denies every connection. That is a
-    // config mistake, not a policy -- fail the listener rather than the traffic.
+fn an_auth_filter_with_no_allow_is_valid_and_denies_everything() {
+    // Security-group semantics all the way up: an empty allowlist is deny-all, a
+    // real state rather than a mistake. Rejecting it would make "is the list
+    // non-empty" load-bearing, and would take the listener down the moment you
+    // comment out the last rule to debug.
+    let t = ip("fd00:dead:beef:1::1");
+
     let c = config::parse("ula fd00:dead:beef::/48\n").unwrap();
-    assert!(aws_ppv2_identity::validate_auth(&c).is_err());
+    assert!(aws_ppv2_identity::validate_auth(&c).is_ok());
+    assert!(!c.permits(b"", t));
 
     let c = config::parse("sni a.test\n").unwrap();
-    assert!(aws_ppv2_identity::validate_auth(&c).is_err());
+    assert!(aws_ppv2_identity::validate_auth(&c).is_ok());
+    assert!(!c.permits(b"a.test", t));
 }
 
 #[test]
