@@ -74,7 +74,7 @@ fn load(
     bytes: &[u8],
     check: fn(&config::Config) -> Result<(), &'static str>,
 ) -> Option<Arc<config::Config>> {
-    match parse(bytes).and_then(|c| check(&c).map(|()| c)) {
+    match parse(bytes).and_then(|c| check(&c).map_err(str::to_string).map(|()| c)) {
         Ok(cfg) => Some(Arc::new(cfg)),
         Err(e) => {
             eprintln!("aws-ppv2-identity: bad filter_config: {e}");
@@ -83,7 +83,7 @@ fn load(
     }
 }
 
-fn parse(bytes: &[u8]) -> Result<config::Config, &'static str> {
+fn parse(bytes: &[u8]) -> Result<config::Config, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "filter_config is not valid UTF-8")?;
     config::parse(text)
 }
@@ -94,8 +94,8 @@ pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
     if cfg.prefix.is_none() {
         return Err("`ppv2` needs `ula` to synthesize an identity");
     }
-    if !cfg.allow.is_empty() || !cfg.scopes.is_empty() {
-        return Err("`ppv2` takes only `ula`; put `allow` and `sni` on the `auth` filter");
+    if !cfg.allow.is_empty() || cfg.scopes.is_some() {
+        return Err("`ppv2` takes only `ula`; put `allow` and `scopes` on the `auth` filter");
     }
     Ok(())
 }
@@ -105,9 +105,9 @@ pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
 /// The two are positional, not about transport -- which is why this is the same
 /// check for TCP and UDP, and why `auth` never has to know which it is:
 ///
-///   `ula` -- I run BEFORE tls_inspector, so I parse the header myself.
-///   `sni` -- I run AFTER it, so a preceding `ppv2` filter already labelled the
-///            socket and the SNI exists to scope by.
+///   `ula`    -- I run BEFORE tls_inspector, so I parse the header myself.
+///   `scopes` -- I run AFTER it, so a preceding `ppv2` filter already labelled the
+///               socket and the SNI exists to scope by.
 ///
 /// Both at once is the contradiction "first and not first".
 pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
@@ -115,9 +115,9 @@ pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
     // an empty security group does. Rejecting it would make "is the list non-empty"
     // load-bearing -- the thing config.rs refuses to do for the same reason -- and
     // would take the listener down when you comment out the last rule to debug.
-    match (cfg.prefix.is_some(), !cfg.scopes.is_empty()) {
+    match (cfg.prefix.is_some(), cfg.scopes.is_some()) {
         (true, false) | (false, true) => Ok(()),
-        (true, true) => Err("`ula` and `sni` are mutually exclusive: `ula` means this filter runs before tls_inspector, so there is no SNI yet"),
-        (false, false) => Err("`auth` needs `ula` (parse the header here) or `sni` (read the label a `ppv2` filter left)"),
+        (true, true) => Err("`ula` and `scopes` are mutually exclusive: `ula` means this filter runs before tls_inspector, so there is no SNI yet"),
+        (false, false) => Err("`auth` needs `ula` (parse the header here) or `scopes` (read the label a `ppv2` filter left)"),
     }
 }

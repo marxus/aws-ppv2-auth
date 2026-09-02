@@ -13,9 +13,9 @@ use std::sync::Arc;
 use abi::envoy_dynamic_module_type_on_listener_filter_status as TcpStatus;
 use abi::envoy_dynamic_module_type_on_udp_listener_filter_status as UdpStatus;
 
-const ULA: &str = "ula fd00:dead:beef::/48\n";
+const ULA: &str = r#""ula":"fd00:dead:beef::/48""#;
 /// sha256("vpce-0123456789abcdef0")[..8] -- see tests/identity.rs.
-const TENANT: &str = ":allow:\nfd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128\n";
+const TENANT: &str = r#""allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128"]"#;
 
 fn ppv2_config(text: &str) -> tcp::Ppv2Config {
     tcp::Ppv2Config {
@@ -49,7 +49,7 @@ fn a_refused_connection_is_not_admitted_by_a_later_on_data() {
     // done on the refusal path, and the done-guard returned Continue on that
     // second call -- admitting a connection with require_ppv2 on. Reproduced
     // exactly: a short non-PPv2 prefix, then more bytes.
-    let fc = ppv2_config(ULA);
+    let fc = ppv2_config(&format!("{{{ULA}}}"));
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -70,7 +70,7 @@ fn a_refused_connection_is_not_admitted_by_a_later_on_data() {
 
 #[test]
 fn require_ppv2_false_still_passes_non_ppv2_through() {
-    let fc = ppv2_config("ula fd00:dead:beef::/48\nrequire_ppv2 false\n");
+    let fc = ppv2_config(r#"{"ula":"fd00:dead:beef::/48","require_ppv2":false}"#);
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -89,7 +89,7 @@ fn a_tenant_header_is_labelled_with_the_synthesized_address_and_drained() {
         &[10, 0, 1, 28],
         Some(b"vpce-0123456789abcdef0"),
     ));
-    let fc = ppv2_config(ULA);
+    let fc = ppv2_config(&format!("{{{ULA}}}"));
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -118,7 +118,7 @@ fn a_partial_header_asks_for_the_total_not_the_remainder() {
     let total = full.len();
     let head = leak(full[..16].to_vec());
 
-    let fc = ppv2_config(ULA);
+    let fc = ppv2_config(&format!("{{{ULA}}}"));
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -139,7 +139,7 @@ fn a_datagram_outside_the_allowlist_is_dropped() {
         &[10, 0, 1, 28],
         Some(b"vpce-somebody-else"),
     ));
-    let fc = udp_config(&format!("{ULA}{TENANT}"));
+    let fc = udp_config(&format!("{{{ULA},{TENANT}}}"));
     let mut envoy = MockEnvoyUdpListenerFilter::new();
     envoy
         .expect_get_datagram_data()
@@ -163,7 +163,7 @@ fn an_allowed_datagram_is_stripped_and_forwarded() {
     dg_vec.extend_from_slice(payload);
     let dg = leak(dg_vec);
 
-    let fc = udp_config(&format!("{ULA}{TENANT}"));
+    let fc = udp_config(&format!("{{{ULA},{TENANT}}}"));
     let mut envoy = MockEnvoyUdpListenerFilter::new();
     envoy
         .expect_get_datagram_data()
@@ -185,7 +185,7 @@ fn a_short_datagram_obeys_require_ppv2_like_every_other_parse_failure() {
     // datagram died while a 20-byte non-PPv2 one passed. Same input, both flags.
     let runt: &'static [u8] = b"\x0d\x0a\x0d\x0a\x00\x0d";
 
-    let strict = udp_config(ULA);
+    let strict = udp_config(&format!("{{{ULA}}}"));
     let mut envoy = MockEnvoyUdpListenerFilter::new();
     envoy
         .expect_get_datagram_data()
@@ -194,7 +194,7 @@ fn a_short_datagram_obeys_require_ppv2_like_every_other_parse_failure() {
     let mut f = strict.new_udp_listener_filter(&mut envoy);
     assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
 
-    let lax = udp_config("ula fd00:dead:beef::/48\nrequire_ppv2 false\n");
+    let lax = udp_config(r#"{"ula":"fd00:dead:beef::/48","require_ppv2":false}"#);
     let mut envoy2 = MockEnvoyUdpListenerFilter::new();
     envoy2
         .expect_get_datagram_data()
@@ -213,7 +213,7 @@ fn an_empty_allowlist_denies_a_well_formed_tenant() {
         &[10, 0, 1, 28],
         Some(b"vpce-0123456789abcdef0"),
     ));
-    let fc = udp_config(ULA);
+    let fc = udp_config(&format!("{{{ULA}}}"));
     let mut envoy = MockEnvoyUdpListenerFilter::new();
     envoy
         .expect_get_datagram_data()
@@ -239,7 +239,8 @@ fn labelled(addr: &'static str, sni: &'static [u8]) -> MockEnvoyListenerFilter {
     envoy
 }
 
-const SCOPED: &str = ":sni:\nl7.mgmt.test\n:allow:\nfd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128\n";
+const SCOPED: &str =
+    r#"{"scopes":[{"sni":["l7.mgmt.test"],"allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128"]}]}"#;
 
 #[test]
 fn auth_admits_a_listed_identity_on_a_matching_sni() {
@@ -322,7 +323,7 @@ fn auth_with_a_ula_parses_the_header_itself() {
         &[10, 0, 1, 28],
         Some(b"vpce-0123456789abcdef0"),
     ));
-    let fc = auth_config(&format!("{ULA}{TENANT}"));
+    let fc = auth_config(&format!("{{{ULA},{TENANT}}}"));
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()

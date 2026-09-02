@@ -89,76 +89,91 @@ manifest list, so the kubelet resolves the architecture.
 
 ## Configuration
 
-A `google.protobuf.StringValue` in `filter_config`, line-oriented so a
-`kubectl diff` of 10,000 entries stays readable:
+A `google.protobuf.Struct`, which Envoy serializes to JSON before handing it to
+the module (`MessageUtil::knownAnyToBytes`, `utility.h:460`). Structured rather
+than a string blob so separate CRs can contribute scopes — see below.
 
-Scalars are `key value`. Lists are sections — `:name:` on its own line, then one
-item per line until the next section:
-
-```text
-ula fd00:dead:beef::/48
-
-:sni:
-l7.mgmt.test
-*.pass.mgmt.test
-:allow:
-fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
-fd00:dead:beef:4::a01:0/112
+```yaml
+filter_config:
+  "@type": type.googleapis.com/google.protobuf.Struct
+  value:
+    scopes:
+      - sni:
+          - l7.mgmt.test
+          - "*.pass.mgmt.test"     # quote it: YAML reads a leading * as an alias
+        allow:
+          - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
 ```
 
-A `:sni:` section opens a scope and may name **several hostnames**, which then
-share the `:allow:` that follows — the shape Envoy's `ServerNameMatcher` uses,
-where one `domains` list maps to one action. An `:allow:` before any `:sni:` is
-the flat list, which is what a listener with no SNI uses.
-
-Generate your own `ula` once per RFC 4193: `fd` plus 40 random bits, nothing set
-below the /48. Unknown keys are an error, and `require_ppv2` takes only `true` or
-`false` — a typo fails the config rather than silently disabling enforcement.
-
-**Allowlist-only, like a security group**: permitted iff some line covers it, so an
-empty list denies everything. There is no `enforce` flag because deriving one from
-"is the list non-empty" would make the single safe state mean allow-any.
-
-**Deny by default, twice over.** An SNI that no `sni` block claims is refused, and
-so is an identity the matched block does not cover. An unmatched SNI does *not* fall
-back to the flat list — that would silently widen every scoped listener.
-
-SNI matching follows Envoy's `ServerNameMatcher`
-(`source/extensions/common/matcher/domain_matcher.h`):
-
-- **exact wins** over any wildcard, whatever the config order
-- **wildcards are tried longest-suffix-first** — `a.mgmt.test` probes `*.mgmt.test`
-  before `*.test`
-- **`*.foo.com` does not match `foo.com`** — the wildcard needs a label in front
-- **`*.foo.com` does match `a.b.foo.com`** — a label-boundary suffix match, not the
-  single-label rule TLS certificates use
-- **ASCII case-insensitive on both sides.** Envoy folds only the SNI, so a pattern
-  written `L7.Mgmt.Test` never matches there; we fold the config too.
-
-Only a whole leading `*.` is a wildcard. `foo.*` and `*bla.com` are kept as literal
-strings rather than rejected, so they never match a real SNI — erring toward deny
-rather than failing the config.
+A scope may name **several hostnames** sharing one list — the shape Envoy's
+`ServerNameMatcher` uses, where one `domains` list maps to one action.
 
 Each filter takes one config shape, and anything else fails the listener:
 
 | filter | config | meaning |
 |---|---|---|
 | `ppv2` | `ula` only | synthesize and label; it never denies, so it takes no rules |
-| `auth` | `ula` + `:allow:` | parse the header here — plain TCP, and UDP |
-| `auth` | `:sni:` + `:allow:` | read the label a `ppv2` filter left — the TLS chain |
+| `auth` | `ula` + `allow` | parse the header here — plain TCP, and UDP |
+| `auth` | `scopes` | read the label a `ppv2` filter left — the TLS chain |
 
-**`ula` and `sni` are mutually exclusive on `auth`, and the reason is positional
-rather than about transport**: `ula` means this filter runs *before*
-`tls_inspector`, so no SNI exists yet; `sni` means it runs *after*, so the socket
-is already labelled. Both at once is the contradiction "first and not first".
-
-That is why `auth` never needs to know whether it is on TCP or UDP — the same
-rules apply to both, and the same validator checks them.
+**`ula` and `scopes` are mutually exclusive, and the reason is positional rather
+than about transport**: `ula` means this filter runs *before* `tls_inspector`, so
+no SNI exists yet; `scopes` means it runs *after*, so the socket is already
+labelled. Both at once is the contradiction "first and not first". That is why
+`auth` never needs to know whether it is on TCP or UDP.
 
 An `auth` filter with no `allow` at all is valid and denies everything — an empty
-allowlist is deny-all, the same as an empty security group. `require_ppv2 false`
+allowlist is deny-all, the same as an empty security group. `require_ppv2: false`
 with a non-empty allowlist is rejected, because unparsed headers yield no address
-to match and would walk straight past it.
+to match and would walk straight past it. Unknown fields fail the config, so a
+typo cannot silently disable enforcement.
+
+### Contributing scopes from separate CRs
+
+`scopes` is an array, so another `EnvoyPatchPolicy` can append to it:
+
+```yaml
+operation:
+  op: add
+  path: /listener_filters/2/typed_config/filter_config/value/scopes/-
+  value:
+    sni: [tenant-a.mgmt.test]
+    allow: [fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128]
+```
+
+Several policies may target one Gateway — verified on EG v1.9.1 — and they apply
+in policy-**name** order, which is also how filter order is fixed.
+
+Two things this depends on:
+
+- **The base must ship `scopes: []`** even when empty, or `/scopes/-` has nothing
+  to append to. Empty means SNI mode with nothing claimed, which denies
+  everything — the right state for a gateway with no tenants onboarded.
+- **The path index is positional.** `/listener_filters/2` assumes
+  `[ppv2, tls_inspector, auth]`; a policy inserting at index 0 shifts it.
+
+**Merging, not chaining.** Every scope lands in one `auth` filter, so precedence
+holds across CRs: an exact name in a tenant's CR still beats a `*.` wildcard in
+the base. Chaining separate `auth` filters cannot do this — whichever filter ran
+first would claim the name and judge it against the wrong list, because
+exact-beats-wildcard is a property of the whole scope set.
+
+### SNI matching
+
+Envoy's `ServerNameMatcher` (`source/extensions/common/matcher/domain_matcher.h`):
+
+- **exact wins** over any wildcard, whatever the config order
+- **wildcards are tried longest-suffix-first** — `a.mgmt.test` probes
+  `*.mgmt.test` before `*.test`
+- **`*.foo.com` does not match `foo.com`** — the wildcard needs a label in front
+- **`*.foo.com` does match `a.b.foo.com`** — a label-boundary suffix match, not
+  the single-label rule TLS certificates use
+- **ASCII case-insensitive on both sides.** Envoy folds only the SNI, so a pattern
+  written `L7.Mgmt.Test` never matches there; we fold the config too.
+
+Only a whole leading `*.` is a wildcard. `foo.*` and `*bla.com` are kept as
+literal strings rather than rejected, so they never match a real SNI — erring
+toward deny rather than failing the config.
 
 ## Why the two filters differ
 
