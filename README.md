@@ -65,7 +65,7 @@ ConfigMap:
 pod:
   volumes:
     - name: aws-ppv2-identity
-      image: { reference: ghcr.io/marxus/aws-ppv2-identity:v0.1.2 }
+      image: { reference: ghcr.io/marxus/aws-ppv2-identity:v0.2.0 }
 container:
   volumeMounts: [{ name: aws-ppv2-identity, mountPath: /modules, readOnly: true }]
   env: [{ name: LD_LIBRARY_PATH, value: /modules }]
