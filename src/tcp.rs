@@ -22,7 +22,10 @@ type Status = abi::envoy_dynamic_module_type_on_listener_filter_status;
 
 enum Decision {
     Label {
-        addr: identity::AddrText,
+        /// Carried alongside the text so `auth` never has to parse the address it
+        /// just formatted -- both fall out of one `synthesize`.
+        id: u128,
+        text: identity::AddrText,
         port: u32,
         len: usize,
     },
@@ -36,19 +39,18 @@ fn inspect<ELF: EnvoyListenerFilter>(envoy: &ELF, prefix: identity::Prefix) -> D
     let chunk = envoy.get_buffer_chunk();
     let buf = chunk.as_ref().map(|c| c.as_slice()).unwrap_or(&[]);
     match ppv2::parse(buf) {
-        Ok(h) => Decision::Label {
-            addr: identity::format(identity::synthesize(prefix, &h)),
-            port: h.src_port as u32,
-            len: h.len,
-        },
+        Ok(h) => {
+            let addr = identity::synthesize(prefix, &h);
+            Decision::Label {
+                id: identity::to_u128(addr),
+                text: identity::format(addr),
+                port: h.src_port as u32,
+                len: h.len,
+            }
+        }
         Err(ppv2::Error::Need(n)) => Decision::Need(n),
         Err(ppv2::Error::Invalid) => Decision::NotProxyProtocol,
     }
-}
-
-fn refuse<ELF: EnvoyListenerFilter>(envoy: &mut ELF) -> Status {
-    envoy.continue_filter_chain(false);
-    Status::StopIteration
 }
 
 // --- ppv2: parse, label, drain ---------------------------------------------
@@ -82,6 +84,16 @@ struct Ppv2Filter {
     refused: bool,
 }
 
+impl Ppv2Filter {
+    /// Close the socket. Sets the terminal flag itself, so no call site can
+    /// refuse without also becoming unable to admit later.
+    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF) -> Status {
+        self.refused = true;
+        envoy.continue_filter_chain(false);
+        Status::StopIteration
+    }
+}
+
 impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
     /// Always inspect bytes; never Continue straight from accept.
     fn on_accept(&mut self, _envoy: &mut ELF) -> Status {
@@ -105,8 +117,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
         }
         // Unreachable: lib.rs rejects a `ppv2` config without `ula`.
         let Some(prefix) = self.cfg.prefix else {
-            self.refused = true;
-            return refuse(envoy);
+            return self.refuse(envoy);
         };
 
         // The buffer borrows `envoy` immutably and set_remote_address needs it
@@ -120,20 +131,20 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
             }
             Decision::NotProxyProtocol => {
                 if self.cfg.require_ppv2 {
-                    self.refused = true;
-                    refuse(envoy)
+                    self.refuse(envoy)
                 } else {
                     self.done = true;
                     Status::Continue
                 }
             }
-            Decision::Label { addr, port, len } => {
+            Decision::Label {
+                text, port, len, ..
+            } => {
                 // is_ipv6 is always true: synthesized is a ULA, passed-through
                 // is already v6. A failure cannot be retried -- the buffer holds
                 // the whole header -- so refuse rather than stall.
-                if !envoy.set_remote_address(addr.as_str(), port, true) {
-                    self.refused = true;
-                    return refuse(envoy);
+                if !envoy.set_remote_address(text.as_str(), port, true) {
+                    return self.refuse(envoy);
                 }
                 envoy.drain_buffer(len);
                 self.done = true;
@@ -167,8 +178,8 @@ struct AuthFilter {
 }
 
 impl AuthFilter {
-    /// Deny by default: the scope must claim the SNI and cover the identity.
-    fn judge<ELF: EnvoyListenerFilter>(&self, envoy: &mut ELF, id: u128) -> Status {
+    /// Deny by default: a scope must claim the SNI and cover the identity.
+    fn judge<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF, id: u128) -> Status {
         let permitted = {
             let sni = envoy.get_requested_server_name();
             let sni = sni.as_ref().map(|b| b.as_slice()).unwrap_or(&[]);
@@ -177,8 +188,14 @@ impl AuthFilter {
         if permitted {
             Status::Continue
         } else {
-            refuse(envoy)
+            self.refuse(envoy)
         }
+    }
+
+    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF) -> Status {
+        self.settled = true;
+        envoy.continue_filter_chain(false);
+        Status::StopIteration
     }
 }
 
@@ -193,7 +210,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
         self.settled = true;
         match labelled_identity(envoy) {
             Some(id) => self.judge(envoy, id),
-            None => refuse(envoy),
+            None => self.refuse(envoy),
         }
     }
 
@@ -211,8 +228,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
             return Status::StopIteration;
         }
         let Some(prefix) = self.cfg.prefix else {
-            self.settled = true;
-            return refuse(envoy);
+            return self.refuse(envoy);
         };
 
         let decision = inspect(envoy, prefix);
@@ -223,20 +239,21 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
                 Status::StopIteration
             }
             // Unlabelled traffic has no identity, so no list can cover it.
-            Decision::NotProxyProtocol => {
+            Decision::NotProxyProtocol => self.refuse(envoy),
+            Decision::Label {
+                id,
+                text,
+                port,
+                len,
+            } => {
                 self.settled = true;
-                refuse(envoy)
-            }
-            Decision::Label { addr, port, len } => {
-                self.settled = true;
-                let Ok(ip) = addr.as_str().parse::<std::net::Ipv6Addr>() else {
-                    return refuse(envoy);
-                };
-                // Label and strip even though we may then close: the access log
-                // should show the identity that was judged.
-                envoy.set_remote_address(addr.as_str(), port, true);
+                // Label and strip even though we may then close, so the access log
+                // shows the identity that was judged. The return is ignored on
+                // purpose: the decision uses `id`, not the socket, so a failed
+                // relabel costs a log line rather than the verdict.
+                let _ = envoy.set_remote_address(text.as_str(), port, true);
                 envoy.drain_buffer(len);
-                self.judge(envoy, identity::to_u128(ip.octets()))
+                self.judge(envoy, id)
             }
         }
     }

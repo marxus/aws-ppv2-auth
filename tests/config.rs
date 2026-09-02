@@ -293,3 +293,19 @@ fn a_partial_wildcard_is_not_a_wildcard() {
     assert_eq!(c.scopes[0].0, Pattern::Exact("mgmt.*".into()));
     assert!(!c.permits(b"mgmt.test", t));
 }
+
+#[test]
+fn udp_goes_through_permits_so_scopes_could_never_be_silently_ignored() {
+    // udp.rs used to consult `allow` directly. lib.rs rejects `sni` on UDP, so it
+    // was correct -- but it was a second enforcement path that would have quietly
+    // ignored scopes the day one arrived. Routing through `permits` with an empty
+    // name means the scoped case denies instead.
+    let t = ip("fd00:dead:beef:1::1");
+    let flat = config::parse("ula fd00:dead:beef::/48\nallow fd00:dead:beef:1::/64\n").unwrap();
+    assert!(flat.permits(b"", t)); // what UDP actually uses
+
+    let scoped =
+        config::parse("ula fd00:dead:beef::/48\nsni a.test\nallow fd00:dead:beef:1::/64\n")
+            .unwrap();
+    assert!(!scoped.permits(b"", t)); // deny, not "fall back to the scope"
+}

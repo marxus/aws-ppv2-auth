@@ -63,18 +63,19 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
             };
 
             // Self-contained: no "read more" here, so a short datagram is simply
-            // not PPv2 and require_ppv2 governs it like any other parse failure.
+            // not PPv2, and require_ppv2 governs it like any other parse failure.
             match ppv2::parse(buf) {
-                Err(ppv2::Error::Need(_)) => Decision::NotProxyProtocol,
                 Ok(h) => {
                     let addr = identity::synthesize(prefix, &h);
-                    if self.cfg.allow.contains(identity::to_u128(addr)) {
+                    // Through `permits` rather than reaching into `allow`, so there
+                    // is one enforcement path. With no scopes it is the flat list;
+                    // if `sni` ever reaches UDP the empty name matches nothing and
+                    // this denies, instead of quietly ignoring the scopes.
+                    if self.cfg.permits(b"", identity::to_u128(addr)) {
                         self.payload.clear();
                         self.payload.extend_from_slice(&buf[h.len..]);
                         Decision::Forward
                     } else {
-                        // Allowlist only: an empty list denies everything, so
-                        // never gate this on the list being non-empty.
                         Decision::Denied
                     }
                 }
