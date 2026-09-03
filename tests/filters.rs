@@ -509,3 +509,17 @@ fn udp_denials_bump_the_only_signal_udp_has() {
     let mut f = fc.new_udp_listener_filter(&mut envoy);
     assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
 }
+
+#[test]
+fn counter_names_are_prefixed_with_the_filter_name() {
+    // All filters on a listener share one metrics_namespace (default
+    // dynamicmodulescustom), so unprefixed names from ppv2 and auth on the same
+    // TLS listener would merge into a single meaningless stat.
+    let mut names = Vec::new();
+    let c = aws_ppv2_identity::stats::Counters::register("auth", |n| {
+        names.push(n.to_string());
+        None
+    });
+    assert_eq!(names, ["auth_allowed", "auth_denied", "auth_not_ppv2"]);
+    assert!(c.allowed.is_none() && c.denied.is_none() && c.not_ppv2.is_none());
+}

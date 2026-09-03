@@ -11,23 +11,7 @@ use std::sync::Arc;
 /// See tcp.rs.
 type Status = abi::envoy_dynamic_module_type_on_udp_listener_filter_status;
 
-/// Counter ids, resolved once at listener build; None never fails the listener.
-#[derive(Clone, Copy, Default)]
-pub struct Counters {
-    pub allowed: Option<EnvoyCounterId>,
-    pub denied: Option<EnvoyCounterId>,
-    pub not_ppv2: Option<EnvoyCounterId>,
-}
-
-impl Counters {
-    pub fn register<EC: EnvoyUdpListenerFilterConfig>(ec: &mut EC) -> Counters {
-        Counters {
-            allowed: ec.define_counter("allowed").ok(),
-            denied: ec.define_counter("denied").ok(),
-            not_ppv2: ec.define_counter("not_ppv2").ok(),
-        }
-    }
-}
+pub use crate::stats::Counters;
 
 fn bump<ELF: EnvoyUdpListenerFilter>(envoy: &ELF, id: Option<EnvoyCounterId>) {
     if let Some(id) = id {

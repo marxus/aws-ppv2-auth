@@ -23,24 +23,7 @@ type Status = abi::envoy_dynamic_module_type_on_listener_filter_status;
 
 // --- ppv2 / ppv2_auth: parse, label, drain, maybe enforce --------------------
 
-/// Counter ids, resolved once at listener build. None means metrics registration
-/// failed or was skipped -- never a reason to fail the listener.
-#[derive(Clone, Copy, Default)]
-pub struct Counters {
-    pub allowed: Option<EnvoyCounterId>,
-    pub denied: Option<EnvoyCounterId>,
-    pub not_ppv2: Option<EnvoyCounterId>,
-}
-
-impl Counters {
-    pub fn register<EC: EnvoyListenerFilterConfig>(ec: &mut EC) -> Counters {
-        Counters {
-            allowed: ec.define_counter("allowed").ok(),
-            denied: ec.define_counter("denied").ok(),
-            not_ppv2: ec.define_counter("not_ppv2").ok(),
-        }
-    }
-}
+pub use crate::stats::Counters;
 
 fn bump<ELF: EnvoyListenerFilter>(envoy: &ELF, id: Option<EnvoyCounterId>) {
     if let Some(id) = id {

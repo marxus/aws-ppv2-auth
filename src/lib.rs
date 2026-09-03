@@ -22,6 +22,7 @@ pub mod cidr;
 pub mod config;
 pub mod identity;
 pub mod ppv2;
+pub mod stats;
 pub mod tcp;
 pub mod udp;
 
@@ -44,17 +45,17 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
     match name {
         "ppv2_auth" => {
             let cfg = load(config_bytes, validate_ppv2_auth)?;
-            let counters = tcp::Counters::register(envoy_filter_config);
+            let counters = counters(name, envoy_filter_config);
             Some(Box::new(tcp::Ppv2Config::enforcing(cfg, counters)))
         }
         "ppv2" => {
             let cfg = load(config_bytes, validate_ppv2)?;
-            let counters = tcp::Counters::register(envoy_filter_config);
+            let counters = counters(name, envoy_filter_config);
             Some(Box::new(tcp::Ppv2Config::labelling(cfg, counters)))
         }
         "auth" => {
             let cfg = load(config_bytes, validate_auth)?;
-            let counters = tcp::Counters::register(envoy_filter_config);
+            let counters = counters(name, envoy_filter_config);
             Some(Box::new(tcp::AuthConfig { cfg, counters }))
         }
         _ => {
@@ -77,8 +78,14 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
         return None;
     }
     let cfg = load(config_bytes, validate_ppv2_auth)?;
-    let counters = udp::Counters::register(envoy_filter_config);
+    let counters = stats::Counters::register(name, |n| envoy_filter_config.define_counter(n).ok());
     Some(Box::new(udp::Ppv2AuthConfig { cfg, counters }))
+}
+
+/// Prefixed with the filter_name: all filters share one metrics namespace, so
+/// unprefixed names from ppv2 and auth on the same listener would merge.
+fn counters<EC: EnvoyListenerFilterConfig>(name: &str, ec: &mut EC) -> stats::Counters {
+    stats::Counters::register(name, |n| ec.define_counter(n).ok())
 }
 
 /// The one place config failures become rejected listeners; Envoy says nothing, so stderr must.

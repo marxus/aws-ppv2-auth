@@ -196,8 +196,11 @@ synthesized identity that was judged; the address class tells you what it was
 | `no_identity_label` | `auth` ran without a `ppv2` filter ahead of it |
 | `set_remote_address_failed` | internal: Envoy rejected the relabel |
 
-Each filter also defines three counters under its `metrics_namespace`:
-`allowed`, `denied`, `not_ppv2`. On UDP the counters are the **only** signal —
+Each filter also defines three counters, prefixed with its filter_name because
+all filters share one `metrics_namespace` (default `dynamicmodulescustom`):
+`<filter_name>_allowed`, `<filter_name>_denied`, `<filter_name>_not_ppv2` —
+Prometheus renders e.g. `envoy_dynamicmodulescustom_auth_denied_total`. On UDP
+the counters are the **only** signal —
 a denied datagram produces no session, no log, and no failure reason, and is
 otherwise indistinguishable from packet loss.
 
