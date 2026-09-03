@@ -17,14 +17,16 @@
 //! A scope may name several hostnames sharing one list -- the shape Envoy's
 //! ServerNameMatcher uses, where one `domains` list maps to one action.
 //!
-//! `ula` and `scopes` are the two ways `auth` can learn an identity and are
-//! mutually exclusive -- see validate_auth in lib.rs. `ula` means it runs before
-//! tls_inspector and parses the header itself; `scopes` means it runs after, and a
-//! `ppv2` filter already labelled the socket.
+//! Each filter_name takes exactly one shape -- see the validators in lib.rs:
+//! `ppv2` and `ppv2_auth` take `ula` (they parse the header themselves, before
+//! tls_inspector), `auth` takes `scopes` (it runs after, reading the label a
+//! `ppv2` filter left).
 //!
-//! Deny by default. No scope matches the SNI, or none covers the identity, and the
-//! connection is closed -- which is why there is no `enforce` flag: deriving one
-//! from "is the list non-empty" would make the safe state mean allow-any.
+//! Deny by default, with no knobs. Traffic without a PPv2 header reached the
+//! listener directly and is refused; an identity nothing covers is refused. There
+//! is deliberately no `enforce` or `require_ppv2` flag -- the filter_name already
+//! says what happens, and a flag derived from config contents would make the safe
+//! state mean allow-any.
 
 use crate::{cidr, identity};
 use serde::Deserialize;
@@ -40,8 +42,6 @@ pub struct Config {
     /// which denies everything -- the state a base config ships in so tenant CRs
     /// have a `scopes` array to append to.
     pub scopes: Option<Vec<Scope>>,
-    /// Drop anything without a PROXY header.
-    pub require_ppv2: bool,
 }
 
 /// Several hostnames sharing one allowlist.
@@ -145,8 +145,6 @@ struct Raw {
     #[serde(default)]
     allow: Vec<String>,
     scopes: Option<Vec<RawScope>>,
-    #[serde(default = "yes")]
-    require_ppv2: bool,
 }
 
 #[derive(Deserialize)]
@@ -156,10 +154,6 @@ struct RawScope {
     sni: Vec<String>,
     #[serde(default)]
     allow: Vec<String>,
-}
-
-fn yes() -> bool {
-    true
 }
 
 fn build(list: &[String]) -> Result<cidr::Set, String> {
@@ -188,18 +182,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
         ),
     };
 
-    // With require_ppv2 off, unparseable traffic passes through -- straight past
-    // every rule. Refuse the combination rather than document it.
-    if !raw.require_ppv2 && !(allow.is_empty() && scopes.is_none()) {
-        return Err(
-            "`require_ppv2: false` passes unparseable traffic straight past `allow`".into(),
-        );
-    }
-
     Ok(Config {
         prefix,
         allow,
         scopes,
-        require_ppv2: raw.require_ppv2,
     })
 }

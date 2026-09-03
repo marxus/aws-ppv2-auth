@@ -11,20 +11,20 @@ use std::sync::Arc;
 /// See tcp.rs.
 type Status = abi::envoy_dynamic_module_type_on_udp_listener_filter_status;
 
-pub struct AuthConfig {
+pub struct Ppv2AuthConfig {
     pub cfg: Arc<config::Config>,
 }
 
-impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for AuthConfig {
+impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for Ppv2AuthConfig {
     fn new_udp_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn UdpListenerFilter<ELF>> {
-        Box::new(Filter {
+        Box::new(Ppv2AuthFilter {
             cfg: self.cfg.clone(),
             payload: Vec::new(),
         })
     }
 }
 
-pub struct Filter {
+struct Ppv2AuthFilter {
     cfg: Arc<config::Config>,
     /// Reused across datagrams: the filter chain is built once per listener per
     /// worker, not per datagram, and a worker is single threaded.
@@ -34,11 +34,12 @@ pub struct Filter {
 enum Decision {
     /// Stripped payload is staged in `self.payload`.
     Forward,
-    Denied,
-    NotProxyProtocol,
+    /// Not on the list, or not PPv2 at all -- no header means the datagram
+    /// reached the listener directly.
+    Deny,
 }
 
-impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
+impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
     fn on_data(&mut self, envoy: &mut ELF) -> Status {
         // Unreachable: lib.rs rejects a UDP config without `ula`. Deny anyway.
         let Some(prefix) = self.cfg.prefix else {
@@ -63,7 +64,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
             };
 
             // Self-contained: no "read more" here, so a short datagram is simply
-            // not PPv2, and require_ppv2 governs it like any other parse failure.
+            // not PPv2 and is dropped like any other parse failure.
             match ppv2::parse(buf) {
                 Ok(h) => {
                     let addr = identity::synthesize(prefix, &h);
@@ -76,10 +77,10 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
                         self.payload.extend_from_slice(&buf[h.len..]);
                         Decision::Forward
                     } else {
-                        Decision::Denied
+                        Decision::Deny
                     }
                 }
-                Err(_) => Decision::NotProxyProtocol,
+                Err(_) => Decision::Deny,
             }
         };
 
@@ -91,14 +92,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Filter {
                     Status::StopIteration
                 }
             }
-            Decision::Denied => Status::StopIteration,
-            Decision::NotProxyProtocol => {
-                if self.cfg.require_ppv2 {
-                    Status::StopIteration
-                } else {
-                    Status::Continue
-                }
-            }
+            Decision::Deny => Status::StopIteration,
         }
     }
 }

@@ -1,15 +1,16 @@
-//! The two TCP listener filters.
+//! The TCP listener filters, one per filter_name.
 //!
-//! `ppv2` parses the PROXY protocol header, labels the socket with the synthesized
-//! identity and drains the header. `auth` decides whether the connection lives.
-//!
-//! They are separate because TLS forces it: the header must be drained before
-//! tls_inspector can see the ClientHello, and the SNI only exists after it has run.
+//! `ppv2` and `ppv2_auth` parse the PROXY header, synthesize the identity and
+//! label the socket; `ppv2_auth` additionally judges it against the flat
+//! allowlist. `auth` reads the label a `ppv2` filter left and scopes it by SNI.
 //!
 //! ```text
-//! tcp  -> [auth, ...]
+//! tcp  -> [ppv2_auth, ...]
 //! tls  -> [ppv2, tls_inspector, auth, ...]
 //! ```
+//!
+//! Non-PPv2 traffic is refused, always: this module is the first thing after the
+//! NLB, so anything without a header reached the listener directly.
 //!
 //! Do not also enable Envoy's proxy_protocol filter -- only one can drain the header.
 
@@ -20,10 +21,46 @@ use std::sync::Arc;
 /// Aliased because the generated name crowds out every signature it appears in.
 type Status = abi::envoy_dynamic_module_type_on_listener_filter_status;
 
+// --- ppv2 / ppv2_auth: parse, label, drain, maybe enforce --------------------
+
+pub struct Ppv2Config {
+    pub cfg: Arc<config::Config>,
+    /// Fixed by the filter_name at listener build -- `ppv2_auth` enforces, `ppv2`
+    /// only labels. Never read from the config, so it cannot drift.
+    pub enforce: bool,
+}
+
+impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for Ppv2Config {
+    fn new_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn ListenerFilter<ELF>> {
+        // Arc, not a global: config_new reruns on every LDS update, so a global
+        // would pin the first config and silently ignore EnvoyPatchPolicy edits.
+        Box::new(Ppv2Filter {
+            cfg: self.cfg.clone(),
+            enforce: self.enforce,
+            // The ceiling up front, so `want` never grows: one allocation, and
+            // a real header completes on the first on_data instead of two.
+            want: ppv2::MAX_HEADER,
+            done: false,
+            refused: false,
+        })
+    }
+}
+
+struct Ppv2Filter {
+    cfg: Arc<config::Config>,
+    enforce: bool,
+    /// TOTAL header bytes wanted from the start of the connection, not the
+    /// remainder: Envoy peeks with MSG_PEEK and never consumes.
+    want: usize,
+    /// Terminal, and asymmetric: `done` admits, `refused` can never later admit.
+    done: bool,
+    refused: bool,
+}
+
 enum Decision {
     Label {
-        /// Carried alongside the text so `auth` never has to parse the address it
-        /// just formatted -- both fall out of one `synthesize`.
+        /// Carried alongside the text so enforcement never has to parse the
+        /// address it just formatted -- both fall out of one `synthesize`.
         id: u128,
         text: identity::AddrText,
         port: u32,
@@ -34,7 +71,7 @@ enum Decision {
     NotProxyProtocol,
 }
 
-/// Shared by both filters: read the buffer, parse, synthesize.
+/// Read the buffer, parse, synthesize.
 fn inspect<ELF: EnvoyListenerFilter>(envoy: &ELF, prefix: identity::Prefix) -> Decision {
     let chunk = envoy.get_buffer_chunk();
     let buf = chunk.as_ref().map(|c| c.as_slice()).unwrap_or(&[]);
@@ -51,37 +88,6 @@ fn inspect<ELF: EnvoyListenerFilter>(envoy: &ELF, prefix: identity::Prefix) -> D
         Err(ppv2::Error::Need(n)) => Decision::Need(n),
         Err(ppv2::Error::Invalid) => Decision::NotProxyProtocol,
     }
-}
-
-// --- ppv2: parse, label, drain ---------------------------------------------
-
-pub struct Ppv2Config {
-    pub cfg: Arc<config::Config>,
-}
-
-impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for Ppv2Config {
-    fn new_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn ListenerFilter<ELF>> {
-        // Arc, not a global: config_new reruns on every LDS update, so a global
-        // would pin the first config and silently ignore EnvoyPatchPolicy edits.
-        Box::new(Ppv2Filter {
-            cfg: self.cfg.clone(),
-            // The ceiling up front, so `want` never grows: one allocation, and
-            // a real header completes on the first on_data instead of two.
-            want: ppv2::MAX_HEADER,
-            done: false,
-            refused: false,
-        })
-    }
-}
-
-struct Ppv2Filter {
-    cfg: Arc<config::Config>,
-    /// TOTAL header bytes wanted from the start of the connection, not the
-    /// remainder: Envoy peeks with MSG_PEEK and never consumes.
-    want: usize,
-    /// Terminal, and asymmetric: `done` admits, `refused` can never later admit.
-    done: bool,
-    refused: bool,
 }
 
 impl Ppv2Filter {
@@ -115,30 +121,25 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
         if self.done {
             return Status::Continue;
         }
-        // Unreachable: lib.rs rejects a `ppv2` config without `ula`.
+        // Unreachable: lib.rs rejects a config without `ula`.
         let Some(prefix) = self.cfg.prefix else {
             return self.refuse(envoy);
         };
 
         // The buffer borrows `envoy` immutably and set_remote_address needs it
         // mutably, so decide here and carry out owned values only.
-        let decision = inspect(envoy, prefix);
-
-        match decision {
+        match inspect(envoy, prefix) {
             Decision::Need(n) => {
                 self.want = n;
                 Status::StopIteration
             }
-            Decision::NotProxyProtocol => {
-                if self.cfg.require_ppv2 {
-                    self.refuse(envoy)
-                } else {
-                    self.done = true;
-                    Status::Continue
-                }
-            }
+            // No header means the client reached the listener directly.
+            Decision::NotProxyProtocol => self.refuse(envoy),
             Decision::Label {
-                text, port, len, ..
+                id,
+                text,
+                port,
+                len,
             } => {
                 // is_ipv6 is always true: synthesized is a ULA, passed-through
                 // is already v6. A failure cannot be retried -- the buffer holds
@@ -146,7 +147,14 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
                 if !envoy.set_remote_address(text.as_str(), port, true) {
                     return self.refuse(envoy);
                 }
+                // Strip the header before judging, so the access log shows the
+                // identity that was judged even when it is then refused.
                 envoy.drain_buffer(len);
+                // The same call udp.rs makes: with no scopes the empty name
+                // selects the flat list.
+                if self.enforce && !self.cfg.permits(b"", id) {
+                    return self.refuse(envoy);
+                }
                 self.done = true;
                 Status::Continue
             }
@@ -154,7 +162,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
     }
 }
 
-// --- auth: establish identity, scope it, allow or close ---------------------
+// --- auth: read the label, scope by SNI, allow or close ----------------------
 
 pub struct AuthConfig {
     pub cfg: Arc<config::Config>,
@@ -164,7 +172,6 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for AuthConfig {
     fn new_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn ListenerFilter<ELF>> {
         Box::new(AuthFilter {
             cfg: self.cfg.clone(),
-            want: ppv2::MAX_HEADER,
             settled: false,
         })
     }
@@ -172,14 +179,28 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for AuthConfig {
 
 struct AuthFilter {
     cfg: Arc<config::Config>,
-    want: usize,
     /// Terminal either way: this filter admits or closes, never both.
     settled: bool,
 }
 
 impl AuthFilter {
-    /// Deny by default: a scope must claim the SNI and cover the identity.
-    fn judge<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF, id: u128) -> Status {
+    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF) -> Status {
+        self.settled = true;
+        envoy.continue_filter_chain(false);
+        Status::StopIteration
+    }
+}
+
+impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
+    /// The whole filter. on_accept runs only once every preceding filter has
+    /// finished, which is what places this after tls_inspector -- so the SNI and
+    /// the label a `ppv2` filter left are both already on the socket.
+    fn on_accept(&mut self, envoy: &mut ELF) -> Status {
+        self.settled = true;
+        let Some(id) = labelled_identity(envoy) else {
+            // No label means no `ppv2` filter ran ahead of us.
+            return self.refuse(envoy);
+        };
         let permitted = {
             let sni = envoy.get_requested_server_name();
             let sni = sni.as_ref().map(|b| b.as_slice()).unwrap_or(&[]);
@@ -192,70 +213,17 @@ impl AuthFilter {
         }
     }
 
-    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF) -> Status {
-        self.settled = true;
-        envoy.continue_filter_chain(false);
-        Status::StopIteration
-    }
-}
-
-impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
-    fn on_accept(&mut self, envoy: &mut ELF) -> Status {
-        if self.cfg.prefix.is_some() {
-            return Status::StopIteration; // needs the header; decides in on_data
-        }
-        // A `ppv2` filter already labelled the socket, so there is nothing to read
-        // and no reason to wait. on_accept runs only once every preceding filter has
-        // finished, which is what places this after tls_inspector.
-        self.settled = true;
-        match labelled_identity(envoy) {
-            Some(id) => self.judge(envoy, id),
-            None => self.refuse(envoy),
-        }
-    }
-
+    /// 0 makes Envoy bypass on_data entirely: this filter reads no bytes.
     fn max_read_bytes(&mut self, _envoy: &mut ELF) -> usize {
-        // 0 makes Envoy skip on_data entirely when the label is already there.
-        if self.cfg.prefix.is_some() {
-            self.want
-        } else {
-            0
-        }
+        0
     }
 
     fn on_data(&mut self, envoy: &mut ELF, _data_length: usize) -> Status {
+        // Unreachable with max_read_bytes 0; fail closed if Envoy ever changes.
         if self.settled {
             return Status::StopIteration;
         }
-        let Some(prefix) = self.cfg.prefix else {
-            return self.refuse(envoy);
-        };
-
-        let decision = inspect(envoy, prefix);
-
-        match decision {
-            Decision::Need(n) => {
-                self.want = n;
-                Status::StopIteration
-            }
-            // Unlabelled traffic has no identity, so no list can cover it.
-            Decision::NotProxyProtocol => self.refuse(envoy),
-            Decision::Label {
-                id,
-                text,
-                port,
-                len,
-            } => {
-                self.settled = true;
-                // Label and strip even though we may then close, so the access log
-                // shows the identity that was judged. The return is ignored on
-                // purpose: the decision uses `id`, not the socket, so a failed
-                // relabel costs a log line rather than the verdict.
-                let _ = envoy.set_remote_address(text.as_str(), port, true);
-                envoy.drain_buffer(len);
-                self.judge(envoy, id)
-            }
-        }
+        self.refuse(envoy)
     }
 }
 

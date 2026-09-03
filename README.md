@@ -127,10 +127,10 @@ rather than half-working — `ppv2_auth` with `scopes` is rejected (it runs befo
 `tls_inspector`, so there is no SNI), and `auth` with a `ula` is too.
 
 An `auth` filter with no `allow` at all is valid and denies everything — an empty
-allowlist is deny-all, the same as an empty security group. `require_ppv2: false`
-with a non-empty allowlist is rejected, because unparsed headers yield no address
-to match and would walk straight past it. Unknown fields fail the config, so a
-typo cannot silently disable enforcement.
+allowlist is deny-all, the same as an empty security group. There is no
+`require_ppv2` knob: this module is the first thing after the NLB, so traffic
+without a header reached the listener directly and is refused, always. Unknown
+fields fail the config, so a typo cannot silently disable enforcement.
 
 ### Contributing scopes from separate CRs
 

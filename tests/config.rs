@@ -18,7 +18,6 @@ fn ula_mode_takes_a_flat_allow_list() {
     assert_eq!(c.prefix, Some([0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef]));
     assert_eq!(c.allow.len(), 2);
     assert!(c.scopes.is_none());
-    assert!(c.require_ppv2);
 }
 
 #[test]
@@ -68,15 +67,22 @@ fn a_ula_with_bits_below_slash_48_is_rejected() {
 }
 
 #[test]
-fn require_ppv2_false_cannot_be_combined_with_an_allowlist() {
-    assert!(config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","require_ppv2":false,"allow":["fd00:dead:beef:1::/64"]}"#
-    )
-    .is_err());
-    assert!(config::parse(r#"{"ula":"fd00:dead:beef::/48","require_ppv2":false}"#).is_ok());
-    assert!(
-        config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1::/64"]}"#).is_ok()
-    );
+fn require_ppv2_no_longer_exists_and_a_config_carrying_it_fails() {
+    // Deleted by design: each filter_name already says what happens to non-PPv2
+    // traffic (refused/dropped, always). deny_unknown_fields makes a leftover
+    // config fail its listener loudly instead of quietly meaning nothing.
+    assert!(config::parse(r#"{"ula":"fd00:dead:beef::/48","require_ppv2":false}"#).is_err());
+    assert!(config::parse(r#"{"ula":"fd00:dead:beef::/48","require_ppv2":true}"#).is_err());
+}
+
+#[test]
+fn a_scope_with_no_sni_names_is_rejected() {
+    // Dead config: it can never match. With multi-CR appends this is most likely
+    // a tenant's mistake, so it fails the listener rather than sitting inert.
+    let c = config::parse(r#"{"scopes":[{"sni":[],"allow":["fd00:dead:beef:1::/64"]}]}"#).unwrap();
+    assert!(validate_auth(&c).is_err());
+    let c = config::parse(r#"{"scopes":[{"allow":["fd00:dead:beef:1::/64"]}]}"#).unwrap();
+    assert!(validate_auth(&c).is_err());
 }
 
 // --- which filter takes which shape ----------------------------------------

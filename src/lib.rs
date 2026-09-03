@@ -48,11 +48,14 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
     match name {
         "ppv2_auth" => {
             let cfg = load(config_bytes, validate_ppv2_auth)?;
-            Some(Box::new(tcp::AuthConfig { cfg }))
+            Some(Box::new(tcp::Ppv2Config { cfg, enforce: true }))
         }
         "ppv2" => {
             let cfg = load(config_bytes, validate_ppv2)?;
-            Some(Box::new(tcp::Ppv2Config { cfg }))
+            Some(Box::new(tcp::Ppv2Config {
+                cfg,
+                enforce: false,
+            }))
         }
         "auth" => {
             let cfg = load(config_bytes, validate_auth)?;
@@ -80,7 +83,7 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
         return None;
     }
     let cfg = load(config_bytes, validate_ppv2_auth)?;
-    Some(Box::new(udp::AuthConfig { cfg }))
+    Some(Box::new(udp::Ppv2AuthConfig { cfg }))
 }
 
 /// The single place a config failure becomes a rejected listener. Envoy says
@@ -89,23 +92,24 @@ fn load(
     bytes: &[u8],
     check: fn(&config::Config) -> Result<(), &'static str>,
 ) -> Option<Arc<config::Config>> {
-    match parse(bytes).and_then(|c| check(&c).map_err(str::to_string).map(|()| c)) {
+    let parsed = std::str::from_utf8(bytes)
+        .map_err(|_| "filter_config is not valid UTF-8".to_string())
+        .and_then(|text| {
+            // Envoy passes an empty string when filter_config is absent; serde
+            // would then say "EOF while parsing a value", which helps nobody.
+            if text.trim().is_empty() {
+                return Err("filter_config is missing".into());
+            }
+            config::parse(text)
+        })
+        .and_then(|c| check(&c).map_err(str::to_string).map(|()| c));
+    match parsed {
         Ok(cfg) => Some(Arc::new(cfg)),
         Err(e) => {
             eprintln!("aws-ppv2-identity: bad filter_config: {e}");
             None
         }
     }
-}
-
-fn parse(bytes: &[u8]) -> Result<config::Config, String> {
-    let text = std::str::from_utf8(bytes).map_err(|_| "filter_config is not valid UTF-8")?;
-    // Envoy passes an empty string when filter_config is absent; serde would then
-    // report "EOF while parsing a value", which is not a useful thing to read.
-    if text.trim().is_empty() {
-        return Err("filter_config is missing".into());
-    }
-    config::parse(text)
 }
 
 /// `ppv2` labels and drains, nothing else -- it never denies, so a rule here would
@@ -146,6 +150,16 @@ pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
     // rule that reads as applied and does nothing.
     if !cfg.allow.is_empty() {
         return Err("`auth` ignores a top-level `allow`; put those rules in a scope");
+    }
+    // A scope with no names can never match -- dead config, and with multi-CR
+    // appends most likely a tenant's mistake. Fail it loudly.
+    if cfg
+        .scopes
+        .iter()
+        .flatten()
+        .any(|scope| scope.names.is_empty())
+    {
+        return Err("a scope needs at least one `sni`");
     }
     Ok(())
 }

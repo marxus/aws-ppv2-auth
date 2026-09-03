@@ -20,6 +20,14 @@ const TENANT: &str = r#""allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128"]"#;
 fn ppv2_config(text: &str) -> tcp::Ppv2Config {
     tcp::Ppv2Config {
         cfg: Arc::new(config::parse(text).unwrap()),
+        enforce: false,
+    }
+}
+
+fn ppv2_auth_config(text: &str) -> tcp::Ppv2Config {
+    tcp::Ppv2Config {
+        cfg: Arc::new(config::parse(text).unwrap()),
+        enforce: true,
     }
 }
 
@@ -29,8 +37,8 @@ fn auth_config(text: &str) -> tcp::AuthConfig {
     }
 }
 
-fn udp_config(text: &str) -> udp::AuthConfig {
-    udp::AuthConfig {
+fn udp_config(text: &str) -> udp::Ppv2AuthConfig {
+    udp::Ppv2AuthConfig {
         cfg: Arc::new(config::parse(text).unwrap()),
     }
 }
@@ -69,16 +77,75 @@ fn a_refused_connection_is_not_admitted_by_a_later_on_data() {
 }
 
 #[test]
-fn require_ppv2_false_still_passes_non_ppv2_through() {
-    let fc = ppv2_config(r#"{"ula":"fd00:dead:beef::/48","require_ppv2":false}"#);
+fn non_ppv2_traffic_is_refused_unconditionally() {
+    // There is no require_ppv2 knob any more: this module is the first thing
+    // after the NLB, so a client without a header reached the listener directly.
+    // Holds for the label-only filter too, not just the enforcing one.
+    for fc in [
+        ppv2_config(&format!("{{{ULA}}}")),
+        ppv2_auth_config(&format!("{{{ULA}}}")),
+    ] {
+        let mut envoy = MockEnvoyListenerFilter::new();
+        envoy
+            .expect_get_buffer_chunk()
+            .returning(|| Some(EnvoyBuffer::new(b"GET / HTTP/1.1\r\n\r\n")));
+        envoy
+            .expect_continue_filter_chain()
+            .withf(|success| !success)
+            .times(1)
+            .returning(|_| ());
+
+        let mut f = fc.new_listener_filter(&mut envoy);
+        assert_eq!(f.on_data(&mut envoy, 18), TcpStatus::StopIteration);
+    }
+}
+
+#[test]
+fn ppv2_auth_enforces_the_flat_list_after_labelling() {
+    // The `enforce` half of ppv2_auth: same parse and label as ppv2, then the
+    // identity must be covered or the socket closes.
+    let listed = leak(build(
+        V2_PROXY,
+        0x11,
+        &[10, 0, 1, 28],
+        Some(b"vpce-0123456789abcdef0"),
+    ));
+    let unlisted = leak(build(
+        V2_PROXY,
+        0x11,
+        &[10, 0, 1, 28],
+        Some(b"vpce-somebody-else"),
+    ));
+
+    let fc = ppv2_auth_config(&format!("{{{ULA},{TENANT}}}"));
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
-        .returning(|| Some(EnvoyBuffer::new(b"GET / HTTP/1.1\r\n\r\n")));
+        .returning(move || Some(EnvoyBuffer::new(listed)));
+    envoy.expect_set_remote_address().returning(|_, _, _| true);
+    envoy.expect_drain_buffer().returning(|_| ());
     envoy.expect_continue_filter_chain().never();
-
     let mut f = fc.new_listener_filter(&mut envoy);
-    assert_eq!(f.on_data(&mut envoy, 18), TcpStatus::Continue);
+    assert_eq!(f.on_data(&mut envoy, listed.len()), TcpStatus::Continue);
+
+    let fc = ppv2_auth_config(&format!("{{{ULA},{TENANT}}}"));
+    let mut envoy = MockEnvoyListenerFilter::new();
+    envoy
+        .expect_get_buffer_chunk()
+        .returning(move || Some(EnvoyBuffer::new(unlisted)));
+    // Still labelled and stripped, so the access log shows what was judged.
+    envoy.expect_set_remote_address().returning(|_, _, _| true);
+    envoy.expect_drain_buffer().returning(|_| ());
+    envoy
+        .expect_continue_filter_chain()
+        .withf(|success| !success)
+        .times(1)
+        .returning(|_| ());
+    let mut f = fc.new_listener_filter(&mut envoy);
+    assert_eq!(
+        f.on_data(&mut envoy, unlisted.len()),
+        TcpStatus::StopIteration
+    );
 }
 
 #[test]
@@ -180,28 +247,23 @@ fn an_allowed_datagram_is_stripped_and_forwarded() {
 }
 
 #[test]
-fn a_short_datagram_obeys_require_ppv2_like_every_other_parse_failure() {
-    // It used to be dropped unconditionally, so with require_ppv2 off a 10-byte
-    // datagram died while a 20-byte non-PPv2 one passed. Same input, both flags.
-    let runt: &'static [u8] = b"\x0d\x0a\x0d\x0a\x00\x0d";
-
-    let strict = udp_config(&format!("{{{ULA}}}"));
-    let mut envoy = MockEnvoyUdpListenerFilter::new();
-    envoy
-        .expect_get_datagram_data()
-        .returning(move || (vec![EnvoyBuffer::new(runt)], runt.len()));
-    envoy.expect_set_datagram_data().never();
-    let mut f = strict.new_udp_listener_filter(&mut envoy);
-    assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
-
-    let lax = udp_config(r#"{"ula":"fd00:dead:beef::/48","require_ppv2":false}"#);
-    let mut envoy2 = MockEnvoyUdpListenerFilter::new();
-    envoy2
-        .expect_get_datagram_data()
-        .returning(move || (vec![EnvoyBuffer::new(runt)], runt.len()));
-    envoy2.expect_set_datagram_data().never();
-    let mut f2 = lax.new_udp_listener_filter(&mut envoy2);
-    assert_eq!(f2.on_data(&mut envoy2), UdpStatus::Continue);
+fn non_ppv2_datagrams_are_dropped_unconditionally() {
+    // Short, and well-formed-but-not-PPv2: both are just "no header", and a
+    // datagram without a header reached the listener directly.
+    for dg in [
+        &b"\x0d\x0a\x0d\x0a\x00\x0d"[..],
+        &b"GET / HTTP/1.1\r\n\r\n"[..],
+    ] {
+        let dg: &'static [u8] = Box::leak(dg.to_vec().into_boxed_slice());
+        let fc = udp_config(&format!("{{{ULA}}}"));
+        let mut envoy = MockEnvoyUdpListenerFilter::new();
+        envoy
+            .expect_get_datagram_data()
+            .returning(move || (vec![EnvoyBuffer::new(dg)], dg.len()));
+        envoy.expect_set_datagram_data().never();
+        let mut f = fc.new_udp_listener_filter(&mut envoy);
+        assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
+    }
 }
 
 #[test]
@@ -315,25 +377,13 @@ fn auth_denies_when_no_preceding_filter_labelled_the_socket() {
 }
 
 #[test]
-fn auth_with_a_ula_parses_the_header_itself() {
-    // The plain TCP chain: no preceding ppv2 filter, so auth does the whole job.
-    let hdr = leak(build(
-        V2_PROXY,
-        0x11,
-        &[10, 0, 1, 28],
-        Some(b"vpce-0123456789abcdef0"),
-    ));
-    let fc = auth_config(&format!("{{{ULA},{TENANT}}}"));
-    let mut envoy = MockEnvoyListenerFilter::new();
-    envoy
-        .expect_get_buffer_chunk()
-        .returning(move || Some(EnvoyBuffer::new(hdr)));
-    envoy.expect_get_requested_server_name().returning(|| None);
-    envoy.expect_set_remote_address().returning(|_, _, _| true);
-    envoy.expect_drain_buffer().returning(|_| ());
+fn auth_never_reads_bytes() {
+    // The scopes filter decides everything in on_accept; max_read_bytes 0 makes
+    // Envoy bypass on_data entirely.
+    let fc = auth_config(SCOPED);
+    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb", b"l7.mgmt.test");
     envoy.expect_continue_filter_chain().never();
-
     let mut f = fc.new_listener_filter(&mut envoy);
-    assert_eq!(f.on_accept(&mut envoy), TcpStatus::StopIteration);
-    assert_eq!(f.on_data(&mut envoy, hdr.len()), TcpStatus::Continue);
+    assert_eq!(f.on_accept(&mut envoy), TcpStatus::Continue);
+    assert_eq!(f.max_read_bytes(&mut envoy), 0);
 }
