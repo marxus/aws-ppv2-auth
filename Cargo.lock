@@ -18,16 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
-name = "aws-ppv2-auth"
-version = "0.5.0"
-dependencies = [
- "envoy-proxy-dynamic-modules-rust-sdk",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -268,6 +258,16 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "ppv2-auth"
+version = "0.5.0"
+dependencies = [
+ "envoy-proxy-dynamic-modules-rust-sdk",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

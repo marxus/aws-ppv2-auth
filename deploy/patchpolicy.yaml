@@ -27,7 +27,7 @@ kind: EnvoyPatchPolicy
 metadata:
   # Sorts before any tenant policy, so this base applies first and the `scopes`
   # array exists for them to append to.
-  name: aws-ppv2-auth-base
+  name: ppv2-auth-base
   namespace: envoy-gateway-system
 spec:
   targetRef:
@@ -50,10 +50,10 @@ spec:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2-auth.auth
+          name: ppv2-auth.auth
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.dynamic_modules.v3.DynamicModuleListenerFilter
-            dynamic_module_config: { name: aws-ppv2-auth }
+            dynamic_module_config: { name: ppv2-auth }
             filter_name: auth
             filter_config:
               # Struct, not StringValue: Envoy serializes it to JSON for the
@@ -98,10 +98,10 @@ spec:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2-auth.ppv2
+          name: ppv2-auth.ppv2
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.dynamic_modules.v3.DynamicModuleListenerFilter
-            dynamic_module_config: { name: aws-ppv2-auth }
+            dynamic_module_config: { name: ppv2-auth }
             filter_name: ppv2
             filter_config:
               "@type": type.googleapis.com/google.protobuf.Struct
@@ -121,10 +121,10 @@ spec:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2-auth.ppv2_auth
+          name: ppv2-auth.ppv2_auth
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.udp.dynamic_modules.v3.DynamicModuleUdpListenerFilter
-            dynamic_module_config: { name: aws-ppv2-auth }
+            dynamic_module_config: { name: ppv2-auth }
             filter_name: ppv2_auth
             filter_config:
               "@type": type.googleapis.com/google.protobuf.Struct
@@ -146,7 +146,7 @@ spec:
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: EnvoyPatchPolicy
 metadata:
-  name: aws-ppv2-auth-tenant-a
+  name: ppv2-auth-tenant-a
   namespace: envoy-gateway-system
 spec:
   targetRef:

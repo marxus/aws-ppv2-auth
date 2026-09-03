@@ -1,5 +1,5 @@
 [package]
-name = "aws-ppv2-auth"
+name = "ppv2-auth"
 version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -18,9 +18,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [lib]
-# Built as libaws_ppv2_auth.so, renamed to libaws-ppv2-auth.so: Envoy
+# Built as libppv2_auth.so, renamed to libppv2-auth.so: Envoy
 # loads lib<name>.so and EG's module-name pattern forbids Rust's underscore.
-name = "aws_ppv2_auth"
+name = "ppv2_auth"
 crate-type = ["cdylib", "rlib"]
 
 # Tuned for runtime, not size. These three are already the maximum the profile

@@ -2,8 +2,8 @@
 
 mod common;
 
-use aws_ppv2_auth::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
 use common::{build, V2_PROXY};
+use ppv2_auth::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
 
 #[test]
 fn privatelink_datagram_header_yields_the_vpce_id() {

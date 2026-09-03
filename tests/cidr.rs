@@ -1,6 +1,6 @@
 //! Allowlist membership: boundaries, collapsing, and the deny-by-default state.
 
-use aws_ppv2_auth::cidr;
+use ppv2_auth::cidr;
 use std::net::Ipv6Addr;
 
 fn p(t: &str) -> u128 {

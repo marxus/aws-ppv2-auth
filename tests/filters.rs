@@ -5,9 +5,9 @@
 
 mod common;
 
-use aws_ppv2_auth::{config, tcp, udp};
 use common::{build, V2_PROXY};
 use envoy_proxy_dynamic_modules_rust_sdk::*;
+use ppv2_auth::{config, tcp, udp};
 use std::sync::Arc;
 
 use abi::envoy_dynamic_module_type_on_listener_filter_status as TcpStatus;
@@ -516,7 +516,7 @@ fn counter_names_are_prefixed_with_the_filter_name() {
     // dynamicmodulescustom), so unprefixed names from ppv2 and auth on the same
     // TLS listener would merge into a single meaningless stat.
     let mut names = Vec::new();
-    let c = aws_ppv2_auth::stats::Counters::register("auth", |n| {
+    let c = ppv2_auth::stats::Counters::register("auth", |n| {
         names.push(n.to_string());
         None
     });

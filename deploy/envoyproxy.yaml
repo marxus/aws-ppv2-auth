@@ -32,13 +32,13 @@ spec:
       envoyDeployment:
         pod:
           volumes:
-            - name: aws-ppv2-auth
+            - name: ppv2-auth
               image:
                 reference: ghcr.io/marxus/aws-ppv2-auth:0.5.0
                 pullPolicy: IfNotPresent
         container:
           volumeMounts:
-            - name: aws-ppv2-auth
+            - name: ppv2-auth
               mountPath: /modules
               readOnly: true
           env:
