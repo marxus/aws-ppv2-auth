@@ -9,7 +9,6 @@ const PREFIX: identity::Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];
 fn scheme() -> identity::Scheme {
     identity::Scheme {
         prefix: PREFIX,
-        via: None,
         sites: Vec::new(),
     }
 }

@@ -1,17 +1,14 @@
 //! Address synthesis: the four ordered cases, and the invariant that everything
-//! synthesized lands inside one of the two configured prefixes and nothing else does.
+//! synthesized lands inside the one ULA /48 and nothing else does.
 
 use ppv2_auth::cidr;
 use ppv2_auth::identity::{
-    self, format, parse_prefix, parse_via_prefix, synthesize, Prefix, Scheme, Site, ViaPrefix,
-    KIND_VIA4, KIND_VPCE,
+    self, format, parse_prefix, synthesize, Prefix, Scheme, Site, KIND_ADDR, KIND_SITE, KIND_VPCE,
 };
 use ppv2_auth::ppv2;
 use std::net::Ipv6Addr;
 
 const TEST_PREFIX: Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];
-/// Tailscale's real 4via6 range: the whole point is that these are their addresses.
-const TEST_VIA: ViaPrefix = [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0x0b, 0x1a];
 
 fn hdr_v4(vpce: &[u8], v4: [u8; 4]) -> ppv2::Header<'_> {
     let mut src = [0u8; 16];
@@ -40,7 +37,6 @@ fn hdr_v6<'a>(vpce: &'a [u8], addr: &str) -> ppv2::Header<'a> {
 fn plain() -> Scheme {
     Scheme {
         prefix: TEST_PREFIX,
-        via: None,
         sites: Vec::new(),
     }
 }
@@ -49,7 +45,6 @@ fn plain() -> Scheme {
 fn with_sites() -> Scheme {
     Scheme {
         prefix: TEST_PREFIX,
-        via: Some(TEST_VIA),
         sites: vec![
             Site {
                 id: 7,
@@ -76,7 +71,7 @@ fn an_onboarded_tenant_becomes_a_real_tailscale_4via6_address() {
     );
     // Byte-identical to `tailscale debug via 7 10.0.1.28/32`, which is the claim
     // the whole site space rests on -- verified against the real binary.
-    assert_eq!(format(a).as_str(), "fd7a:115c:a1e0:b1a:0:7:a00:11c");
+    assert_eq!(format(a).as_str(), "fd00:dead:beef:b1a:0:7:a00:11c");
     assert_eq!(u16::from_be_bytes([a[10], a[11]]), 7);
     assert_eq!(&a[12..16], &[10, 0, 1, 28]);
     // Bits 64-79 are tailscale's padding and must stay zero, or it is not a via address.
@@ -89,7 +84,7 @@ fn a_site_matched_by_nat_prefix_carries_no_machine() {
     // to encode. Zero reads as "this tenant, machine unknown" and stays inside
     // the tenant's own /96.
     let a = synthesize(&with_sites(), &hdr_v4(b"", [203, 0, 113, 7]));
-    assert_eq!(format(a).as_str(), "fd7a:115c:a1e0:b1a:0:2::");
+    assert_eq!(format(a).as_str(), "fd00:dead:beef:b1a:0:2::");
     assert_eq!(&a[12..16], &[0, 0, 0, 0]);
 }
 
@@ -99,7 +94,7 @@ fn an_onboarded_tenant_over_ipv6_has_no_ipv4_to_carry() {
         &with_sites(),
         &hdr_v6(b"vpce-0123456789abcdef0", "2001:db8::1"),
     );
-    assert_eq!(format(a).as_str(), "fd7a:115c:a1e0:b1a:0:7::");
+    assert_eq!(format(a).as_str(), "fd00:dead:beef:b1a:0:7::");
     // Still the site, so a /96 rule for that tenant still admits it.
     assert_eq!(u16::from_be_bytes([a[10], a[11]]), 7);
 }
@@ -109,16 +104,15 @@ fn the_whole_site_range_fits_in_group_six() {
     let mut s = with_sites();
     s.sites[0].id = 65535;
     let a = synthesize(&s, &hdr_v4(b"vpce-0123456789abcdef0", [10, 0, 1, 28]));
-    assert_eq!(format(a).as_str(), "fd7a:115c:a1e0:b1a:0:ffff:a00:11c");
+    assert_eq!(format(a).as_str(), "fd00:dead:beef:b1a:0:ffff:a00:11c");
 }
 
 #[test]
-fn without_a_via_prefix_a_named_site_is_ignored() {
-    // `sites` alone cannot move traffic into a space that was never configured.
-    let mut s = with_sites();
-    s.via = None;
-    let a = synthesize(&s, &hdr_v4(b"vpce-0123456789abcdef0", [10, 0, 1, 28]));
-    assert_eq!(a[..6], TEST_PREFIX[..]);
+fn an_empty_site_table_sends_everything_to_the_other_kinds() {
+    // There is no second prefix to withhold any more: sites alone decide.
+    let mut sc = with_sites();
+    sc.sites.clear();
+    let a = synthesize(&sc, &hdr_v4(b"vpce-0123456789abcdef0", [10, 0, 1, 28]));
     assert_eq!(u16::from_be_bytes([a[6], a[7]]), KIND_VPCE);
 }
 
@@ -168,7 +162,7 @@ fn different_tenants_land_on_different_addresses() {
 #[test]
 fn no_vpce_id_falls_back_to_4via6_with_the_client_ipv4_in_the_low_32_bits() {
     let a = synthesize(&plain(), &hdr_v4(b"", [18, 199, 230, 161]));
-    assert_eq!(u16::from_be_bytes([a[6], a[7]]), KIND_VIA4);
+    assert_eq!(u16::from_be_bytes([a[6], a[7]]), KIND_ADDR);
     assert_eq!(&a[12..16], &[18, 199, 230, 161]);
     // The hash half is zero, which is what distinguishes this from kind 1.
     assert_eq!(&a[8..12], &[0, 0, 0, 0]);
@@ -186,7 +180,7 @@ fn the_two_kinds_never_collide() {
 }
 
 #[test]
-fn the_site_space_and_the_ula_never_collide() {
+fn the_three_kinds_never_collide() {
     // Same tenant, same machine, onboarded or not -- two spaces, two addresses,
     // and neither can be mistaken for the other by a prefix rule.
     let named = synthesize(
@@ -195,8 +189,11 @@ fn the_site_space_and_the_ula_never_collide() {
     );
     let stranger = synthesize(&plain(), &hdr_v4(b"vpce-0123456789abcdef0", [10, 0, 1, 28]));
     assert_ne!(named, stranger);
-    assert_eq!(named[..8], TEST_VIA[..]);
+    // One /48 now, so what separates them is the kind, not the prefix.
+    assert_eq!(named[..6], TEST_PREFIX[..]);
     assert_eq!(stranger[..6], TEST_PREFIX[..]);
+    assert_eq!(u16::from_be_bytes([named[6], named[7]]), KIND_SITE);
+    assert_eq!(u16::from_be_bytes([stranger[6], stranger[7]]), KIND_VPCE);
 }
 
 // --- pass-through -----------------------------------------------------------
@@ -238,7 +235,6 @@ fn an_ipv6_site_prefix_matches_a_v6_client() {
     // through the ::ffff: lift.
     let s = Scheme {
         prefix: TEST_PREFIX,
-        via: Some(TEST_VIA),
         sites: vec![Site {
             id: 9,
             vpce: Vec::new(),
@@ -246,7 +242,7 @@ fn an_ipv6_site_prefix_matches_a_v6_client() {
         }],
     };
     let a = synthesize(&s, &hdr_v6(b"", "2001:db8::1"));
-    assert_eq!(format(a).as_str(), "fd7a:115c:a1e0:b1a:0:9::");
+    assert_eq!(format(a).as_str(), "fd00:dead:beef:b1a:0:9::");
 }
 
 // --- prefixes ---------------------------------------------------------------
@@ -263,26 +259,6 @@ fn prefix_parsing_insists_on_a_ula_slash_48() {
     assert_eq!(
         parse_prefix("fd00:dead:beef:1::/48"),
         Err("prefix has bits set below /48")
-    );
-}
-
-#[test]
-fn via_prefix_parsing_insists_on_a_ula_slash_64() {
-    // A /64, not a /48: tailscale spends bits 64-95 on padding and the site.
-    assert_eq!(
-        parse_via_prefix("fd7a:115c:a1e0:b1a::/64").unwrap(),
-        TEST_VIA
-    );
-    assert!(parse_via_prefix("fd7a:115c:a1e0:b1a::").is_ok());
-    // fd7a is inside fc00::/7, so the unique-local rule is unchanged.
-    assert_eq!(parse_via_prefix("2001:db8::/64"), Err("not unique-local"));
-    assert_eq!(
-        parse_via_prefix("fd7a:115c:a1e0:b1a::/48"),
-        Err("via prefix must be /64")
-    );
-    assert_eq!(
-        parse_via_prefix("fd7a:115c:a1e0:b1a:1::/64"),
-        Err("via prefix has bits set below /64")
     );
 }
 

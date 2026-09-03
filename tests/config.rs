@@ -17,8 +17,7 @@ fn ula_mode_takes_a_flat_allow_list() {
     let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128","fd00:dead:beef:4::12c7:0/112"]}"#).unwrap();
     let scheme = c.scheme.as_ref().unwrap();
     assert_eq!(scheme.prefix, [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef]);
-    // No site space configured, so everything falls to the ULA.
-    assert!(scheme.via.is_none());
+    // Nothing onboarded, so every header falls to kind 1 or 4.
     assert!(scheme.sites.is_empty());
     assert_eq!(c.allow.len(), 2);
     assert!(c.scopes.is_none());
@@ -297,14 +296,13 @@ fn duplicate_names_take_the_first_scope() {
 #[test]
 fn sites_take_endpoint_ids_and_prefixes_of_either_family() {
     let c = config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","via":"fd7a:115c:a1e0:b1a::/64",
+        r#"{"ula":"fd00:dead:beef::/48",
              "sites":[{"id":1,"members":["vpce-028ff61de1d1fea8c","3.126.239.93/32"]},
                        {"id":2,"members":["203.0.113.0/24","2001:db8::/32"]},
                        {"id":3,"members":["vpce-0aaa","vpce-0bbb"]}]}"#,
     )
     .unwrap();
     let s = c.scheme.as_ref().unwrap();
-    assert!(s.via.is_some());
     assert_eq!(s.sites.len(), 3);
 
     // Order is the generator's, not ours -- kro sorts the keys before emitting.
@@ -327,7 +325,7 @@ fn sites_take_endpoint_ids_and_prefixes_of_either_family() {
 #[test]
 fn a_bare_site_address_is_a_single_host() {
     let c = config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","via":"fd7a:115c:a1e0:b1a::/64",
+        r#"{"ula":"fd00:dead:beef::/48",
              "sites":[{"id":5,"members":["198.51.100.7"]}]}"#,
     )
     .unwrap();
@@ -352,10 +350,9 @@ fn a_malformed_site_fails_the_config() {
 }
 
 #[test]
-fn via_and_sites_need_a_ula() {
+fn sites_need_a_ula() {
     // They describe how a header is encoded, and only a filter that parses the
     // header does that -- so on `auth`, which has no `ula`, they are dead config.
-    assert!(config::parse(r#"{"via":"fd7a:115c:a1e0:b1a::/64"}"#).is_err());
     assert!(config::parse(r#"{"sites":[{"id":1,"members":["vpce-a"]}]}"#).is_err());
     assert!(
         config::parse(r#"{"scopes":[{"sni":["x"]}],"sites":[{"id":1,"members":["vpce-a"]}]}"#)
@@ -365,14 +362,17 @@ fn via_and_sites_need_a_ula() {
 
 #[test]
 fn the_filters_that_encode_are_the_ones_that_take_sites() {
-    let sited = r#"{"ula":"fd00:dead:beef::/48","via":"fd7a:115c:a1e0:b1a::/64","sites":[{"id":1,"members":["vpce-a"]}]}"#;
+    let sited = r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":1,"members":["vpce-a"]}]}"#;
     // Both header-parsing filters accept it.
     assert!(validate_ppv2(&config::parse(sited).unwrap()).is_ok());
     assert!(validate_ppv2_auth(&config::parse(sited).unwrap()).is_ok());
-    // `auth` cannot even express it: no `ula` means parse already refused.
+    // `auth` cannot express it at all: `sites` needs `ula`, and `auth` with a
+    // `ula` is rejected in turn -- so no config exists where `auth` sees a site.
     assert!(
-        config::parse(r#"{"scopes":[{"sni":["x"]}],"via":"fd7a:115c:a1e0:b1a::/64"}"#).is_err()
+        config::parse(r#"{"scopes":[{"sni":["x"]}],"sites":[{"id":1,"members":["vpce-a"]}]}"#)
+            .is_err()
     );
+    assert!(validate_auth(&config::parse(sited).unwrap()).is_err());
 }
 
 #[test]

@@ -25,43 +25,37 @@ the whole job itself.
 Every policy engine here matches addresses — Envoy RBAC, `CiliumNetworkPolicy` —
 and none can match a `vpce-id`. So synthesize one:
 
-An **onboarded** tenant — one the `sites` table names — gets a real Tailscale
-4via6 address, so the same value reads as identity here and as a route there:
+**One ULA holds all three cases**, told apart by the kind in group 4:
 
 ```text
-fd7a:115c:a1e0:b1a : 0000 : 0007 : 0a00:011c
-└──── via /64 ────┘  zero   site   client IPv4
+fd0b:1003:5ec0 : 0b1a : 0000 : 0007 : 0a00:011c   KIND_SITE, an onboarded tenant
+fd0b:1003:5ec0 : 0001 : 7b53:e75b   : 0a00:011c   KIND_VPCE, a tenant no site claims
+fd0b:1003:5ec0 : 0004 : 0000:0000   : 0a00:011c   KIND_ADDR, no vpce-id at all
+└── /48 ULA ──┘  └kind┘  └ body ───┘  client IPv4
 ```
 
-Verified bit-identical to `tailscale debug via 7 10.0.1.28/32`. The site sits in
-group 6 and the IPv4 in the low 32 bits, which is RFC 6052 embedding for the
-`<via>:0:<site>::/96` that CoreDNS's `dns64` plugin already declares — so the
-encoding is the standard one rather than a private invention.
+`0xb1a` spells "via" the way Tailscale's own 4via6 range does, and the site sits
+in group 6 where Tailscale keeps it — so a site address has the same *shape* as a
+4via6 address without being one. That is deliberate: 4via6 translation is keyed
+to Tailscale's prefix inside the client, verified by `tailscale debug via`
+answering identically with `--socket=/nonexistent`, i.e. from a compile-time
+constant and not from anything the coordination server said. **An address here is
+an identity and never a route.** Routes stay Tailscale's; identity is ours.
 
-Anyone else lands in the fallback ULA, derived rather than looked up, so the data
-plane holds no knowledge of a stranger:
-
-```text
-fd00:dead:beef : 0001 : 7b53:e75b : 0a00:011c
-└── /48 ULA ──┘  └kind┘  └ hash ─┘  client IPv4
-                    1 = sha256(vpce-id), an un-onboarded tenant
-                    4 = no vpce-id, so the hash half is zero
-```
-
-Reproduce a hash with
+Reproduce a kind-1 hash with
 `printf %s vpce-0123456789abcdef0 | sha256sum | cut -c1-8`.
 
 | header says | result |
 |---|---|
-| resolves to a site, by `vpce-id` | `via` + site + the tenant's own IPv4 |
-| resolves to a site, by source prefix | `via` + site, low 32 bits **zero** |
+| resolves to a site, by `vpce-id` | `b1a` + site + the tenant's own IPv4 |
+| resolves to a site, by source prefix | `b1a` + site, low 32 bits **zero** |
 | a `vpce-id` no site claims | kind 1, `sha256(id)` + client IPv4 |
-| no `vpce-id`, IPv4 client | kind 4, 4via6 |
+| no `vpce-id`, IPv4 client | kind 4, the address alone |
 | no `vpce-id`, IPv6 client | **passed through unchanged** |
 
-A v6 client already *is* an address, so encoding could only lose information.
-The invariant: everything inside one of the two configured prefixes was
-synthesized here, everything outside them is a real client address.
+A v6 client already *is* an address, so encoding could only lose information. The
+invariant: everything inside the `/48` was synthesized here, everything outside
+it is a real client address.
 
 **Why a source prefix carries no machine.** Through PrivateLink the header holds
 the tenant's own address — measured, the NLB reports the consumer-side 5-tuple —
@@ -70,18 +64,15 @@ it, so the address is not in their space at all; zero reads honestly as "this
 tenant, machine unknown" and still sits inside the tenant's own `/96`. The real
 source is in the access log either way.
 
-**Trust is split within one address, and that is worth knowing before writing a
-rule.** The site or hash half comes from an AWS-assigned id the sender cannot
-choose. The low 32 bits are whatever their machine put in its own packets. So a
-`/96` rule naming a tenant is a boundary; a `/128` naming one of their machines
-is a convenience, and not something to lean on against that tenant.
+**Trust is split within one address.** The site or hash half comes from an
+AWS-assigned id the sender cannot choose. The low 32 bits are whatever their
+machine put in its own packets. So a `/96` rule naming a tenant is a boundary; a
+`/128` naming one of their machines is a convenience, and not something to lean
+on against that tenant.
 
-Two coarse rules still fall out of the kind group — `…:1::/64` is any
-un-onboarded tenant, `…:4::/64` is any IPv4 client — and an IPv4 `/N` maps onto
-`/(96+N)`.
-
-The address is a label, not a route. Nothing is ever sent from it, so there is no
-spoofing concern and nothing for a CNI's source-IP verification to reject.
+Coarse rules fall out of the kind group — `…:b1a::/64` is any onboarded tenant,
+`…:1::/64` any un-onboarded one, `…:4::/64` any plain IPv4 client — and an IPv4
+`/N` maps onto `/(96+N)`.
 
 ## What it buys
 
@@ -149,13 +140,12 @@ Each filter takes one config shape, and anything else fails the listener:
 | `ppv2` | `ula` only | synthesize and label; it never denies, so it takes no rules |
 | `auth` | `scopes` | read the label a `ppv2` filter left — the TLS chain |
 
-`via` and `sites` are optional and belong wherever `ula` does: they describe how a
-header is encoded, and only a filter that parses the header does that. On `auth`
-they are rejected, because there they would read as applied and do nothing.
+`sites` is optional and belongs wherever `ula` does: it describes how a header
+is encoded, and only a filter that parses the header does that. On `auth` it is
+rejected, because there it would read as applied and do nothing.
 
 ```yaml
-    ula: fd00:dead:beef::/48
-    via: fd7a:115c:a1e0:b1a::/64        # tailscale's 4via6 range, a /64 not a /48
+    ula: fd0b:1003:5ec0::/48
     sites:
       - id: 1
         members: [vpce-028ff61de1d1fea8c, 3.126.239.93/32]
@@ -179,8 +169,8 @@ prefix, so it is refused. Overlapping prefixes across sites are **not** detected
 here; keep them disjoint where the table is generated, or which site wins depends
 on iteration order.
 
-Without `via` there is no site space and everything falls to `ula`, which is what
-this module did before v0.6.0.
+An empty or absent `sites` sends every header to kind 1 or 4, which is what this
+module did before v0.6.0.
 
 The split exists only because TLS forces it: `auth` needs the SNI, which exists
 only after `tls_inspector`, and `tls_inspector` cannot find a ClientHello until

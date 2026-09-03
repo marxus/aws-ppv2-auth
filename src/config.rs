@@ -129,8 +129,6 @@ impl Config {
 #[serde(deny_unknown_fields)]
 struct Raw {
     ula: Option<String>,
-    /// Tailscale's 4via6 /64. Without it there is no site space and everything uses `ula`.
-    via: Option<String>,
     /// The tenant table: an id, and the vpce-ids and source prefixes that resolve to it.
     ///
     /// A LIST OF OBJECTS, not a map keyed by id, and that is a constraint from the
@@ -243,18 +241,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let scheme = match &raw.ula {
         Some(u) => Some(identity::Scheme {
             prefix: identity::parse_prefix(u).map_err(str::to_string)?,
-            via: match &raw.via {
-                Some(v) => Some(identity::parse_via_prefix(v).map_err(str::to_string)?),
-                None => None,
-            },
             sites: build_sites(raw.sites)?,
         }),
         None => {
-            if raw.via.is_some() || !raw.sites.is_empty() {
-                return Err(
-                    "`via` and `sites` need `ula`; they describe how a header is encoded"
-                        .to_string(),
-                );
+            if !raw.sites.is_empty() {
+                return Err("`sites` needs `ula`; it describes how a header is encoded".to_string());
             }
             None
         }

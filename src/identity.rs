@@ -1,48 +1,39 @@
 //! Turning a PROXY protocol header into an IPv6 address that policy can match.
-//! See README for why. The invariant: everything synthesized here is inside one
-//! of the two configured prefixes, everything outside them is a real client
-//! address.
-//!
-//! An ONBOARDED tenant -- one the `sites` table names -- gets a real Tailscale
-//! 4via6 address, so the same value reads as identity here and as a route there:
+//! See README for why. ONE ULA holds all three cases, told apart by the kind in
+//! group 4 -- the invariant is that everything inside the /48 was synthesized
+//! here and everything outside it is a real client address.
 //!
 //! ```text
-//! fd7a:115c:a1e0:b1a : 0000 : 0007 : 0a00:011c
-//! └──── via /64 ────┘  zero   site   client IPv4
+//! fd0b:1003:5ec0 : 0b1a : 0000 : 0007 : 0a00:011c   KIND_SITE, an onboarded tenant
+//! fd0b:1003:5ec0 : 0001 : 7b53:e75b   : 0a00:011c   KIND_VPCE, a tenant no site claims
+//! fd0b:1003:5ec0 : 0004 : 0000:0000   : 0a00:011c   KIND_ADDR, no vpce-id at all
+//! └── /48 ULA ──┘  └kind┘  └ body ───┘  client IPv4
 //! ```
 //!
-//! Verified bit-identical to `tailscale debug via 7 10.0.1.28/32`. The site sits
-//! in group 6 and the IPv4 in the low 32 bits, which is RFC 6052 embedding for
-//! the `<via>:0:<site>::/96` that CoreDNS's dns64 plugin already declares.
+//! 0xb1a spells "via" the way tailscale's own 4via6 range does, and the site sits
+//! in group 6 where tailscale keeps it -- so a site address is the same SHAPE as
+//! a 4via6 address without being one. It deliberately is not: 4via6 translation
+//! is keyed to tailscale's own prefix inside the client, so an address here is an
+//! identity and never a route. Routes stay tailscale's; identity is ours.
 //!
-//! Anyone else lands in the fallback ULA, which is the older scheme narrowed to
-//! make room for the client address:
-//!
-//! ```text
-//! fd00:dead:beef : 0001 : 7b53:e75b : 0a00:011c
-//! └── /48 ULA ──┘  └kind┘  └ hash ─┘  client IPv4
-//!                    1 = sha256(vpce-id), an un-onboarded tenant
-//!                    4 = no vpce-id, so the hash half is zero
-//! ```
-//!
-//! The hash is 32 bits rather than the 64 it had before v0.6.0. It now only ever
-//! labels STRANGERS -- an onboarded tenant has an allocated site -- and a mined
-//! collision costs ~2^32 endpoint creations, so the width buys nothing next to
-//! carrying the address that says WHICH machine called.
+//! The kind-1 hash is 32 bits rather than 64. It only ever labels STRANGERS now
+//! -- an onboarded tenant has an allocated site -- and a mined collision costs
+//! ~2^32 endpoint creations, so the width buys nothing next to carrying the
+//! address that says WHICH machine called.
 
 use crate::cidr;
 use crate::ppv2;
 use sha2::{Digest, Sha256};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// An onboarded tenant. 0xb1a spells "via" the way tailscale's own range does,
+/// and it is a KIND here rather than a second prefix -- one /48 holds all three.
+pub const KIND_SITE: u16 = 0x0b1a;
 pub const KIND_VPCE: u16 = 1;
-pub const KIND_VIA4: u16 = 4;
+pub const KIND_ADDR: u16 = 4;
 
 /// The /48 ULA prefix: per RFC 4193, `fd` + 40 random bits, generated once.
 pub type Prefix = [u8; 6];
-
-/// Tailscale's 4via6 range, a /64. Theirs, not ours, so it is configured rather than assumed.
-pub type ViaPrefix = [u8; 8];
 
 /// One onboarded tenant: the identifiers that resolve to it, and the id they resolve to.
 #[derive(Debug)]
@@ -58,8 +49,7 @@ pub struct Site {
 #[derive(Debug)]
 pub struct Scheme {
     pub prefix: Prefix,
-    /// Absent means no site space is configured, so everything uses the fallback ULA.
-    pub via: Option<ViaPrefix>,
+    /// Empty means nothing is onboarded, so every header falls to kind 1 or 4.
     pub sites: Vec<Site>,
 }
 
@@ -112,10 +102,12 @@ fn site_of(sites: &[Site], h: &ppv2::Header) -> Option<SiteMatch> {
 
 /// Four cases, and the order matters.
 pub fn synthesize(scheme: &Scheme, h: &ppv2::Header) -> [u8; 16] {
-    // An onboarded tenant, in the site space.
-    if let (Some(via), Some(m)) = (scheme.via, site_of(&scheme.sites, h)) {
-        let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&via);
+    let mut out = [0u8; 16];
+    out[..6].copy_from_slice(&scheme.prefix);
+
+    // An onboarded tenant: kind b1a, then the site, then the machine.
+    if let Some(m) = site_of(&scheme.sites, h) {
+        out[6..8].copy_from_slice(&KIND_SITE.to_be_bytes());
         out[10..12].copy_from_slice(&m.id.to_be_bytes());
         // Zero unless the source is the tenant's own address: <via>:0:<site>:: reads
         // as "this tenant, machine unknown" and stays inside the tenant's own /96.
@@ -124,9 +116,6 @@ pub fn synthesize(scheme: &Scheme, h: &ppv2::Header) -> [u8; 16] {
         }
         return out;
     }
-
-    let mut out = [0u8; 16];
-    out[..6].copy_from_slice(&scheme.prefix);
 
     // A vpce-id is not an address, so give it one.
     if !h.vpce.is_empty() {
@@ -146,7 +135,7 @@ pub fn synthesize(scheme: &Scheme, h: &ppv2::Header) -> [u8; 16] {
     }
 
     // Low 32 bits, so a v4 /N becomes a v6 /(96+N).
-    out[6..8].copy_from_slice(&KIND_VIA4.to_be_bytes());
+    out[6..8].copy_from_slice(&KIND_ADDR.to_be_bytes());
     out[12..16].copy_from_slice(&h.src[..4]);
     out
 }
@@ -207,58 +196,26 @@ pub fn to_u128(addr: [u8; 16]) -> u128 {
     u128::from_be_bytes(addr)
 }
 
-/// Shared by both widths. `wrong_width` is passed in because &'static str cannot be formatted.
-fn parse_ula(
-    text: &str,
-    want: u8,
-    wrong_width: &'static str,
-    low_bits: &'static str,
-) -> Result<[u8; 16], &'static str> {
+pub fn parse_prefix(text: &str) -> Result<Prefix, &'static str> {
     let (ip_text, bits) = match text.split_once('/') {
         Some((ip, b)) => (ip, Some(b.parse::<u8>().map_err(|_| "bad prefix length")?)),
         None => (text, None),
     };
     let ip: Ipv6Addr = ip_text.parse().map_err(|_| "bad IPv6 address")?;
     if let Some(b) = bits {
-        if b != want {
-            return Err(wrong_width);
+        if b != 48 {
+            return Err("prefix must be /48");
         }
     }
     let o = ip.octets();
     if o[0] & 0xfe != 0xfc {
         return Err("not unique-local");
     }
-    // Only the bytes above the prefix are kept, so lower bits would vanish silently.
-    let kept = (want / 8) as usize;
-    if o[kept..].iter().any(|&b| b != 0) {
-        return Err(low_bits);
+    // Only the first 6 bytes are kept, so lower bits would vanish silently.
+    if o[6..].iter().any(|&b| b != 0) {
+        return Err("prefix has bits set below /48");
     }
-    Ok(o)
-}
-
-pub fn parse_prefix(text: &str) -> Result<Prefix, &'static str> {
-    let o = parse_ula(
-        text,
-        48,
-        "prefix must be /48",
-        "prefix has bits set below /48",
-    )?;
     let mut p = [0u8; 6];
     p.copy_from_slice(&o[..6]);
-    Ok(p)
-}
-
-/// The site space is a /64, not a /48: tailscale spends bits 64-79 on nothing and
-/// 80-95 on the site, so the prefix we own ends at 64. Still unique-local -- fd7a
-/// is inside fc00::/7 -- so that check is unchanged.
-pub fn parse_via_prefix(text: &str) -> Result<ViaPrefix, &'static str> {
-    let o = parse_ula(
-        text,
-        64,
-        "via prefix must be /64",
-        "via prefix has bits set below /64",
-    )?;
-    let mut p = [0u8; 8];
-    p.copy_from_slice(&o[..8]);
     Ok(p)
 }
