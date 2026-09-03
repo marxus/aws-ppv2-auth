@@ -21,8 +21,7 @@ const V2_PROXY: u8 = 0x21;
 /// One type byte plus a two-byte length.
 const TLV_HEADER: usize = 3;
 
-/// Bounds memory per connection: `Need(len)` becomes Envoy's per-connection peek
-/// buffer, so uncapped, 16 bytes of input reserves 64KB. Real headers are <= 112.
+/// Caps Envoy's per-connection peek buffer: uncapped, 16 attacker bytes reserve 64KB. Real headers <= 112.
 pub const MAX_HEADER: usize = 256;
 
 /// Source and destination port, after the addresses.
@@ -48,8 +47,7 @@ pub struct Header<'a> {
 }
 
 pub fn parse(buf: &[u8]) -> Result<Header<'_>, Error> {
-    // Separate from the compare below so the common path keeps a constant-length
-    // signature compare; folding them costs 2x (4.4 -> 9.1 ns measured).
+    // Kept separate so the common path compares a constant length; folding costs 2x (4.4 -> 9.1 ns).
     if buf.len() < PREAMBLE {
         let n = buf.len().min(SIGNATURE.len());
         if buf[..n] != SIGNATURE[..n] {
@@ -77,8 +75,7 @@ pub fn parse(buf: &[u8]) -> Result<Header<'_>, Error> {
         0x2 => true,
         _ => return Err(Error::Invalid),
     };
-    // One runtime-sized path for both families; two constant-folded ones save
-    // ~3ns and double the function.
+    // One runtime-sized path for both families; constant-folding saves ~3ns and doubles the function.
     let addr_size = if is_v6 { 16 } else { 4 };
     let block_len = addr_size * 2 + PORTS;
     if body.len() < block_len {
@@ -100,10 +97,7 @@ pub fn parse(buf: &[u8]) -> Result<Header<'_>, Error> {
     })
 }
 
-/// The AWS endpoint id from the 0xEA TLV, or empty.
-///
-/// A TLV claiming a length past the end stops the walk rather than failing the
-/// header, because AWS pads with NOOP and length alone tells you nothing.
+/// The 0xEA vpce-id, or empty; an overlong TLV stops the walk (AWS pads with NOOP) rather than failing the header.
 fn find_vpce(tlvs: &[u8]) -> &[u8] {
     let mut i = 0;
     while i + TLV_HEADER <= tlvs.len() {
@@ -112,8 +106,7 @@ fn find_vpce(tlvs: &[u8]) -> &[u8] {
         if end > tlvs.len() {
             break;
         }
-        // First match wins: last-wins let a duplicate 0xEA decide the identity.
-        // value_len > 1 so the subtype byte exists and the id is non-empty.
+        // First match wins (last-wins let a duplicate 0xEA pick the identity); len > 1 keeps the id non-empty.
         if tlvs[i] == TLV_AWS && value_len > 1 && tlvs[i + TLV_HEADER] == AWS_SUBTYPE_VPCE_ID {
             return &tlvs[i + TLV_HEADER + 1..end];
         }

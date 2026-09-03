@@ -35,11 +35,7 @@ fn init() -> bool {
     true
 }
 
-/// Returning None makes Envoy reject the listener, so a module that cannot parse
-/// its config never sees traffic.
-///
-/// `name` is the `filter_name` from the DynamicModuleListenerFilter proto, which is
-/// how one .so exposes more than one filter.
+/// None rejects the listener; `name` is the proto's filter_name, how one .so exposes three filters.
 fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerFilter>(
     _envoy_filter_config: &mut EC,
     name: &str,
@@ -73,9 +69,7 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
     config_bytes: &[u8],
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
     if name != "ppv2_auth" {
-        // UDP is always the whole job in one filter: the ABI has no filter state
-        // and no set_remote_address, so nothing can hand an identity onward, and
-        // there is no handshake for `auth` to scope by.
+        // The UDP ABI has no way to hand an identity onward, so UDP is one filter.
         eprintln!("aws-ppv2-identity: UDP supports only filter_name ppv2_auth, got {name:?}");
         return None;
     }
@@ -83,8 +77,7 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
     Some(Box::new(udp::Ppv2AuthConfig { cfg }))
 }
 
-/// The single place a config failure becomes a rejected listener. Envoy says
-/// nothing about why it rejected one, so stderr is the only thread to pull.
+/// The one place config failures become rejected listeners; Envoy says nothing, so stderr must.
 fn load(
     bytes: &[u8],
     check: fn(&config::Config) -> Result<(), &'static str>,
@@ -92,8 +85,7 @@ fn load(
     let parsed = std::str::from_utf8(bytes)
         .map_err(|_| "filter_config is not valid UTF-8".to_string())
         .and_then(|text| {
-            // Envoy passes an empty string when filter_config is absent; serde
-            // would then say "EOF while parsing a value", which helps nobody.
+            // Absent filter_config arrives as ""; serde's EOF error helps nobody.
             if text.trim().is_empty() {
                 return Err("filter_config is missing".into());
             }
@@ -109,8 +101,7 @@ fn load(
     }
 }
 
-/// `ppv2` labels and drains, nothing else -- it never denies, so a rule here would
-/// read as applied and do nothing.
+/// `ppv2` only labels and drains; a rule here would read as applied and do nothing.
 pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
     if cfg.prefix.is_none() {
         return Err("`ppv2` needs `ula` to synthesize an identity");
@@ -121,10 +112,7 @@ pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// `ppv2_auth` is the whole job in one filter: plain TCP, and UDP.
-///
-/// It runs before anything else, so there is no SNI to scope by -- an empty
-/// `allow` is fine and denies everything, the way an empty security group does.
+/// `ppv2_auth`: the whole job in one filter (TCP and UDP); empty `allow` is deny-all, like an empty SG.
 pub fn validate_ppv2_auth(cfg: &config::Config) -> Result<(), &'static str> {
     if cfg.prefix.is_none() {
         return Err("`ppv2_auth` needs `ula` to synthesize an identity");
@@ -143,13 +131,11 @@ pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
     if cfg.scopes.is_none() {
         return Err("`auth` needs `scopes`");
     }
-    // A top-level `allow` is never consulted once scopes exist, so it would be a
-    // rule that reads as applied and does nothing.
+    // Never consulted once scopes exist -- it would read as applied and do nothing.
     if !cfg.allow.is_empty() {
         return Err("`auth` ignores a top-level `allow`; put those rules in a scope");
     }
-    // A scope with no names can never match -- dead config, and with multi-CR
-    // appends most likely a tenant's mistake. Fail it loudly.
+    // A nameless scope can never match: dead config, likely a tenant CR mistake.
     if cfg
         .scopes
         .iter()

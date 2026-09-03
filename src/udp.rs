@@ -26,16 +26,14 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for Ppv2AuthConfi
 
 struct Ppv2AuthFilter {
     cfg: Arc<config::Config>,
-    /// Reused across datagrams: the filter chain is built once per listener per
-    /// worker, not per datagram, and a worker is single threaded.
+    /// Reused across datagrams -- the filter is per-listener-per-worker and single threaded.
     payload: Vec<u8>,
 }
 
 enum Decision {
     /// Stripped payload is staged in `self.payload`.
     Forward,
-    /// Not on the list, or not PPv2 at all -- no header means the datagram
-    /// reached the listener directly.
+    /// Not on the list, or not PPv2 -- headerless means it reached the listener directly.
     Deny,
 }
 
@@ -45,8 +43,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
         let Some(prefix) = self.cfg.prefix else {
             return Status::StopIteration;
         };
-        // Several chunks are possible; the single-chunk case -- every real NLB
-        // datagram -- borrows in place and costs no allocation.
+        // Single chunk (every real NLB datagram) borrows in place; multi-chunk joins.
         let decision = {
             let (chunks, total) = envoy.get_datagram_data();
             let joined: Option<Vec<u8>> = if chunks.len() == 1 {
@@ -63,8 +60,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
                 None => chunks[0].as_slice(),
             };
 
-            // Self-contained: no "read more" here, so a short datagram is simply
-            // not PPv2 and is dropped like any other parse failure.
+            // Datagrams are self-contained: a short one is simply not PPv2.
             match ppv2::parse(buf) {
                 Ok(h) => {
                     let addr = identity::synthesize(prefix, &h);

@@ -16,8 +16,7 @@ use std::net::Ipv6Addr;
 pub const KIND_VPCE: u16 = 1;
 pub const KIND_VIA4: u16 = 4;
 
-/// The /48 ULA prefix. Per RFC 4193 this must be `fd` plus 40 random bits,
-/// generated once for the deployment -- do not use fd00::/8 directly.
+/// The /48 ULA prefix: per RFC 4193, `fd` + 40 random bits, generated once.
 pub type Prefix = [u8; 6];
 
 /// Three cases, and the order matters.
@@ -33,8 +32,7 @@ pub fn synthesize(prefix: Prefix, h: &ppv2::Header) -> [u8; 16] {
         return out;
     }
 
-    // Keeps kind 4 purely IPv4, which is what makes /(96+N) safe: 2000::/3 reads
-    // as IPv4 32-63.x and used to collide with real IPv4 rules.
+    // Pass-through keeps kind 4 purely IPv4 -- 2000::/3 read as IPv4 used to collide with real rules.
     if h.is_v6 {
         return h.src;
     }
@@ -45,10 +43,7 @@ pub fn synthesize(prefix: Prefix, h: &ppv2::Header) -> [u8; 16] {
     out
 }
 
-/// Text form for set_remote_address, in a stack buffer.
-///
-/// Keeps std's formatter so the output stays canonical RFC 5952, but drops the
-/// heap allocation `to_string()` would cost. 46 bytes is the longest IPv6 form.
+/// RFC 5952 text via std's formatter, in a stack buffer -- no `to_string()` heap alloc.
 pub struct AddrText {
     buf: [u8; 46],
     len: usize,

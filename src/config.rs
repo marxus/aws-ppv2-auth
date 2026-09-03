@@ -33,14 +33,11 @@ use serde::Deserialize;
 
 #[derive(Debug)]
 pub struct Config {
-    /// Present when this filter derives identity itself by parsing PPv2. Absent on
-    /// the `auth` filter of a TLS chain, where `ppv2` already labelled the socket.
+    /// Present iff this filter parses PPv2 itself; `auth` has none and reads the label.
     pub prefix: Option<identity::Prefix>,
     /// Used when `scopes` is absent.
     pub allow: cidr::Set,
-    /// `None` is "not SNI mode". `Some([])` is SNI mode with nothing claimed yet,
-    /// which denies everything -- the state a base config ships in so tenant CRs
-    /// have a `scopes` array to append to.
+    /// None = flat-list mode. Some([]) = SNI mode, nothing claimed, deny all -- the appendable base state.
     pub scopes: Option<Vec<Scope>>,
 }
 
@@ -51,10 +48,7 @@ pub struct Scope {
     pub allow: cidr::Set,
 }
 
-/// One `sni` entry, stored ASCII-lowercased.
-///
-/// `Suffix` holds the hostname with `*.` already stripped, so `*.foo.com` becomes
-/// `Suffix("foo.com")` -- the shape domain_matcher.h:264-267 uses.
+/// One `sni` entry, lowercased; `*.foo.com` is `Suffix("foo.com")` per domain_matcher.h:264.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Pattern {
     Exact(String),
@@ -64,9 +58,7 @@ pub enum Pattern {
 impl Pattern {
     fn parse(text: &str) -> Pattern {
         let lower = text.to_ascii_lowercase();
-        // Only a whole leading `*.` is a wildcard (domain_matcher.h:225). Anything
-        // else -- `foo.*`, `*bla.com` -- stays Exact, so it never matches a real SNI
-        // rather than failing the config. Erring toward deny, not toward allow.
+        // Only a whole leading `*.` is a wildcard (domain_matcher.h:225); `foo.*` etc. stay Exact and never match.
         match lower.strip_prefix("*.") {
             Some(rest) if !rest.is_empty() => Pattern::Suffix(rest.to_string()),
             _ => Pattern::Exact(lower),
@@ -74,12 +66,7 @@ impl Pattern {
     }
 }
 
-/// Compare a lowercased pattern against raw SNI bytes, folding as we go.
-///
-/// Envoy's own domain_matcher never folds its config, so a pattern written
-/// `L7.Mgmt.Test` silently never matches there -- the SNI always arrives lowercased
-/// from the socket. We fold both sides. SNI is ASCII by spec, so this needs no
-/// allocation and no UTF-8 check.
+/// Byte-wise fold-compare: unlike domain_matcher.h we fold BOTH sides, so a mixed-case config still matches.
 fn eq_fold(pat: &str, sni: &[u8]) -> bool {
     pat.len() == sni.len()
         && pat
@@ -95,20 +82,12 @@ impl Config {
             .is_some_and(|set| set.contains(addr))
     }
 
-    /// The flat-list judgment for filters that run before any SNI exists.
-    /// Routed through `permits` so there is exactly one enforcement path -- if
-    /// scopes ever reach such a filter, the empty name matches nothing and this
-    /// denies rather than silently ignoring them.
+    /// Flat-list judgment via `permits`, so stray scopes deny instead of being ignored.
     pub fn permits_unscoped(&self, addr: u128) -> bool {
         self.permits(b"", addr)
     }
 
-    /// The list this connection is judged against, or None if no scope claims it.
-    ///
-    /// Envoy's ServerNameMatcher order (domain_matcher.h:78-101): exact first, then
-    /// wildcards longest-suffix-first. The walk consumes through each dot, so the
-    /// loop variable IS the next candidate -- `a.b.foo.com` probes `b.foo.com`,
-    /// then `foo.com`, then `com`.
+    /// ServerNameMatcher order (domain_matcher.h:78-101): exact, then wildcards longest-suffix-first.
     fn allowlist_for(&self, sni: &[u8]) -> Option<&cidr::Set> {
         let Some(scopes) = &self.scopes else {
             return Some(&self.allow);
@@ -144,8 +123,7 @@ impl Config {
 
 // --- the JSON shape --------------------------------------------------------
 
-/// `deny_unknown_fields` is what makes a typo fail the config rather than silently
-/// disable enforcement -- the same reason the old line format rejected stray keys.
+/// deny_unknown_fields: a typo fails the config instead of silently disabling enforcement.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {

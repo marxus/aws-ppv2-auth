@@ -20,12 +20,9 @@ pub struct Set {
 }
 
 impl Set {
-    /// Last range whose start <= addr, then one bounds check. Ranges are disjoint
-    /// and sorted, so at most one can contain addr. `partition_point` emits a
-    /// branchless search: 20.2 -> 13.1 ns over 10,000 entries.
+    /// Last range whose start <= addr, then one bounds check -- disjoint+sorted, so at most one can contain it.
     pub fn contains(&self, addr: u128) -> bool {
-        // O(1) instead of O(log n) on the deny path -- the one an attacker
-        // controls the volume of. Measured 19.0 -> 0.3 ns.
+        // O(1) on the deny path, the one an attacker controls (19.0 -> 0.3 ns measured).
         if addr < self.span.0 || addr > self.span.1 {
             return false;
         }
@@ -69,8 +66,7 @@ pub fn build(list: &str) -> Result<Set, &'static str> {
     build_from(std::iter::once(list))
 }
 
-/// The same, from one string per `allow` line, so config::parse can hand its
-/// lines over instead of joining them into a String for this to split again.
+/// The same, taking one string per `allow` entry -- no join-then-resplit.
 pub fn build_from<'a>(lists: impl Iterator<Item = &'a str>) -> Result<Set, &'static str> {
     let mut raw: Vec<Range> = Vec::new();
     for list in lists {
@@ -83,8 +79,7 @@ pub fn build_from<'a>(lists: impl Iterator<Item = &'a str>) -> Result<Set, &'sta
     }
     raw.sort_unstable_by_key(|r| r.start);
 
-    // Overlapping ranges collapse. Adjacent-but-not-overlapping ones deliberately
-    // do not: it would save one entry and cost a `+ 1` that overflows at u128::MAX.
+    // Overlaps collapse; adjacent ranges deliberately do not -- the `+ 1` overflows at u128::MAX.
     let mut ranges: Vec<Range> = Vec::with_capacity(raw.len());
     for r in raw {
         match ranges.last_mut() {
