@@ -72,12 +72,12 @@ spec:
                       - l7.mgmt.test
                       - "*.pass.mgmt.test"
                     allow:
-                      - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+                      - fd00:dead:beef:1:7b53:e75b:a00:11c/128
                   - sni:
                       - tcp.mgmt.test
                     allow:
                       - fd00:dead:beef:4::a01:0/112
-                      - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+                      - fd00:dead:beef:1:7b53:e75b:a00:11c/128
 
     # Added second, ends up in the middle. Without this the SNI is always empty
     # and every connection is denied -- fail-closed, but look here first if so.
@@ -131,7 +131,7 @@ spec:
               value:
                 ula: fd00:dead:beef::/48
                 allow:
-                  - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+                  - fd00:dead:beef:1:7b53:e75b:a00:11c/128
 
 ---
 # A tenant contributing its own scope, from its own CR.
@@ -167,4 +167,4 @@ spec:
           sni:
             - tenant-a.mgmt.test
           allow:
-            - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+            - fd00:dead:beef:1:7b53:e75b:a00:11c/128

@@ -26,7 +26,7 @@ spec:
       - name: tenant-a
         action: Allow
         principal:
-          clientCIDRs: [fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128]
+          clientCIDRs: [fd00:dead:beef:1:7b53:e75b:a00:11c/128]
 
       # Coarse rules the kind nibble gives you for free.
       - name: any-privatelink-tenant

@@ -14,8 +14,8 @@ use abi::envoy_dynamic_module_type_on_listener_filter_status as TcpStatus;
 use abi::envoy_dynamic_module_type_on_udp_listener_filter_status as UdpStatus;
 
 const ULA: &str = r#""ula":"fd00:dead:beef::/48""#;
-/// sha256("vpce-0123456789abcdef0")[..8] -- see tests/identity.rs.
-const TENANT: &str = r#""allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128"]"#;
+/// sha256("vpce-0123456789abcdef0")[..4] plus the client 10.0.1.28 -- see tests/identity.rs.
+const TENANT: &str = r#""allow":["fd00:dead:beef:1:7b53:e75b:a00:11c/128"]"#;
 
 fn ppv2_config(text: &str) -> tcp::Ppv2Config {
     tcp::Ppv2Config::labelling(
@@ -131,6 +131,9 @@ fn ppv2_auth_enforces_the_flat_list_after_labelling() {
         .expect_get_buffer_chunk()
         .returning(move || Some(EnvoyBuffer::new(listed)));
     envoy.expect_set_remote_address().returning(|_, _, _| true);
+    envoy
+        .expect_set_dynamic_metadata_string()
+        .returning(|_, _, _| ());
     envoy.expect_drain_buffer().returning(|_| ());
     envoy.expect_continue_filter_chain().never();
     let mut f = fc.new_listener_filter(&mut envoy);
@@ -141,8 +144,22 @@ fn ppv2_auth_enforces_the_flat_list_after_labelling() {
     envoy
         .expect_get_buffer_chunk()
         .returning(move || Some(EnvoyBuffer::new(unlisted)));
-    // Still labelled and stripped, so the access log shows what was judged.
+    // Still labelled, attributed and stripped, so the access log shows what was
+    // judged AND who it was -- a refused connection is the case where knowing
+    // that matters most.
     envoy.expect_set_remote_address().returning(|_, _, _| true);
+    envoy
+        .expect_set_dynamic_metadata_string()
+        .withf(|ns, key, value| {
+            ns == "ppv2_auth"
+                && match key {
+                    "vpce_id" => value == "vpce-somebody-else",
+                    "src" => value == "10.0.1.28",
+                    _ => false,
+                }
+        })
+        .times(2)
+        .returning(|_, _, _| ());
     envoy.expect_drain_buffer().returning(|_| ());
     envoy
         .expect_set_downstream_transport_failure_reason()
@@ -174,9 +191,25 @@ fn a_tenant_header_is_labelled_with_the_synthesized_address_and_drained() {
         .returning(move || Some(EnvoyBuffer::new(hdr)));
     envoy
         .expect_set_remote_address()
-        .withf(|addr, _port, is_ipv6| addr == "fd00:dead:beef:1:7b53:e75b:6e3d:cfdb" && *is_ipv6)
+        .withf(|addr, _port, is_ipv6| addr == "fd00:dead:beef:1:7b53:e75b:a00:11c" && *is_ipv6)
         .times(1)
         .returning(|_, _, _| true);
+    // What the NLB attested, for the access log. The vpce-id is the TLV the load
+    // balancer wrote, NOT the request header that used to be logged and was a
+    // bypass -- and `src` is the tenant's own machine, which the identity may not
+    // carry once a site matches by NAT prefix.
+    envoy
+        .expect_set_dynamic_metadata_string()
+        .withf(|ns, key, value| {
+            ns == "ppv2_auth"
+                && match key {
+                    "vpce_id" => value == "vpce-0123456789abcdef0",
+                    "src" => value == "10.0.1.28",
+                    _ => false,
+                }
+        })
+        .times(2)
+        .returning(|_, _, _| ());
     // The whole header is stripped, so the backend sees only its own protocol.
     envoy
         .expect_drain_buffer()
@@ -313,12 +346,12 @@ fn labelled(addr: &'static str, sni: &'static [u8]) -> MockEnvoyListenerFilter {
 }
 
 const SCOPED: &str =
-    r#"{"scopes":[{"sni":["l7.mgmt.test"],"allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128"]}]}"#;
+    r#"{"scopes":[{"sni":["l7.mgmt.test"],"allow":["fd00:dead:beef:1:7b53:e75b:a00:11c/128"]}]}"#;
 
 #[test]
 fn auth_admits_a_listed_identity_on_a_matching_sni() {
     let fc = auth_config(SCOPED);
-    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb", b"l7.mgmt.test");
+    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:a00:11c", b"l7.mgmt.test");
     envoy.expect_continue_filter_chain().never();
 
     let mut f = fc.new_listener_filter(&mut envoy);
@@ -331,7 +364,7 @@ fn auth_admits_a_listed_identity_on_a_matching_sni() {
 fn auth_denies_an_sni_that_no_scope_claims() {
     // The headline rule: no match is a deny, even for an otherwise valid tenant.
     let fc = auth_config(SCOPED);
-    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb", b"other.mgmt.test");
+    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:a00:11c", b"other.mgmt.test");
     envoy
         .expect_set_downstream_transport_failure_reason()
         .returning(|_| ());
@@ -366,7 +399,7 @@ fn auth_denies_an_unlisted_identity_on_a_matching_sni() {
 fn auth_denies_when_there_is_no_sni_at_all() {
     // A plaintext connection, or tls_inspector missing from the chain. Fail closed.
     let fc = auth_config(SCOPED);
-    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb", b"");
+    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:a00:11c", b"");
     envoy
         .expect_set_downstream_transport_failure_reason()
         .returning(|_| ());
@@ -404,7 +437,7 @@ fn auth_never_reads_bytes() {
     // The scopes filter decides everything in on_accept; max_read_bytes 0 makes
     // Envoy bypass on_data entirely.
     let fc = auth_config(SCOPED);
-    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb", b"l7.mgmt.test");
+    let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:a00:11c", b"l7.mgmt.test");
     envoy.expect_continue_filter_chain().never();
     let mut f = fc.new_listener_filter(&mut envoy);
     assert_eq!(f.on_accept(&mut envoy), TcpStatus::Continue);

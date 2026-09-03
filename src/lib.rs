@@ -112,7 +112,7 @@ fn load(
 
 /// `ppv2` only labels and drains; a rule here would read as applied and do nothing.
 pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.prefix.is_none() {
+    if cfg.scheme.is_none() {
         return Err("`ppv2` needs `ula` to synthesize an identity");
     }
     if !cfg.allow.is_empty() || cfg.scopes.is_some() {
@@ -123,7 +123,7 @@ pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
 
 /// `ppv2_auth`: the whole job in one filter (TCP and UDP); empty `allow` is deny-all, like an empty SG.
 pub fn validate_ppv2_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.prefix.is_none() {
+    if cfg.scheme.is_none() {
         return Err("`ppv2_auth` needs `ula` to synthesize an identity");
     }
     if cfg.scopes.is_some() {
@@ -134,7 +134,7 @@ pub fn validate_ppv2_auth(cfg: &config::Config) -> Result<(), &'static str> {
 
 /// `auth` reads the label a preceding `ppv2` filter left, and scopes it by SNI.
 pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.prefix.is_some() {
+    if cfg.scheme.is_some() {
         return Err("`auth` reads the label `ppv2` left, so it takes no `ula`; use `ppv2_auth`");
     }
     if cfg.scopes.is_none() {

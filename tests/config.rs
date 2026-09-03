@@ -15,7 +15,11 @@ const OTHER: &str = "fd00:dead:beef:9::1";
 #[test]
 fn ula_mode_takes_a_flat_allow_list() {
     let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128","fd00:dead:beef:4::12c7:0/112"]}"#).unwrap();
-    assert_eq!(c.prefix, Some([0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef]));
+    let scheme = c.scheme.as_ref().unwrap();
+    assert_eq!(scheme.prefix, [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef]);
+    // No site space configured, so everything falls to the ULA.
+    assert!(scheme.via.is_none());
+    assert!(scheme.sites.is_empty());
     assert_eq!(c.allow.len(), 2);
     assert!(c.scopes.is_none());
 }
@@ -286,4 +290,86 @@ fn duplicate_names_take_the_first_scope() {
     .unwrap();
     assert!(c.permits(b"dup.test", a));
     assert!(!c.permits(b"dup.test", b));
+}
+
+// --- sites -----------------------------------------------------------------
+
+#[test]
+fn sites_take_endpoint_ids_and_prefixes_of_either_family() {
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","via":"fd7a:115c:a1e0:b1a::/64",
+             "sites":{"1":["vpce-028ff61de1d1fea8c","3.126.239.93/32"],
+                      "2":["203.0.113.0/24","2001:db8::/32"],
+                      "3":["vpce-0aaa","vpce-0bbb"]}}"#,
+    )
+    .unwrap();
+    let s = c.scheme.as_ref().unwrap();
+    assert!(s.via.is_some());
+    assert_eq!(s.sites.len(), 3);
+
+    // Ordered by id, because Raw holds a BTreeMap -- a config that round-trips
+    // reads the same twice, which is what keeps the listener from churning.
+    assert_eq!(
+        s.sites.iter().map(|x| x.id).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+
+    // An id is opaque and kept verbatim; a prefix is lifted into the cidr Set.
+    assert_eq!(s.sites[0].vpce.len(), 1);
+    assert_eq!(&*s.sites[0].vpce[0], b"vpce-028ff61de1d1fea8c");
+    assert!(s.sites[0].cidrs.contains(ip("::ffff:3.126.239.93")));
+    assert!(s.sites[1].cidrs.contains(ip("::ffff:203.0.113.7")));
+    assert!(s.sites[1].cidrs.contains(ip("2001:db8::1")));
+    assert!(!s.sites[1].cidrs.contains(ip("::ffff:203.0.114.1")));
+    assert_eq!(s.sites[2].vpce.len(), 2);
+    assert!(s.sites[2].cidrs.is_empty());
+}
+
+#[test]
+fn a_bare_site_address_is_a_single_host() {
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","via":"fd7a:115c:a1e0:b1a::/64",
+             "sites":{"5":["198.51.100.7"]}}"#,
+    )
+    .unwrap();
+    let s = &c.scheme.as_ref().unwrap().sites[0];
+    assert!(s.cidrs.contains(ip("::ffff:198.51.100.7")));
+    assert!(!s.cidrs.contains(ip("::ffff:198.51.100.8")));
+}
+
+#[test]
+fn a_malformed_site_fails_the_config() {
+    // Same rule as the allowlist: a typo must fail rather than silently shrink
+    // the table, which would quietly demote a tenant to the fallback ULA.
+    for bad in [
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"nope":["vpce-a"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"0":["vpce-a"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"70000":["vpce-a"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["10.0.0.0/40"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["10.0.0.0/x"]}}"#,
+    ] {
+        assert!(config::parse(bad).is_err(), "accepted {bad}");
+    }
+}
+
+#[test]
+fn via_and_sites_need_a_ula() {
+    // They describe how a header is encoded, and only a filter that parses the
+    // header does that -- so on `auth`, which has no `ula`, they are dead config.
+    assert!(config::parse(r#"{"via":"fd7a:115c:a1e0:b1a::/64"}"#).is_err());
+    assert!(config::parse(r#"{"sites":{"1":["vpce-a"]}}"#).is_err());
+    assert!(config::parse(r#"{"scopes":[{"sni":["x"]}],"sites":{"1":["vpce-a"]}}"#).is_err());
+}
+
+#[test]
+fn the_filters_that_encode_are_the_ones_that_take_sites() {
+    let sited =
+        r#"{"ula":"fd00:dead:beef::/48","via":"fd7a:115c:a1e0:b1a::/64","sites":{"1":["vpce-a"]}}"#;
+    // Both header-parsing filters accept it.
+    assert!(validate_ppv2(&config::parse(sited).unwrap()).is_ok());
+    assert!(validate_ppv2_auth(&config::parse(sited).unwrap()).is_ok());
+    // `auth` cannot even express it: no `ula` means parse already refused.
+    assert!(
+        config::parse(r#"{"scopes":[{"sni":["x"]}],"via":"fd7a:115c:a1e0:b1a::/64"}"#).is_err()
+    );
 }

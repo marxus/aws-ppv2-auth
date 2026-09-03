@@ -5,6 +5,15 @@ use std::time::Instant;
 
 const PREFIX: identity::Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];
 
+/// No sites: this measures the encode, and a site lookup is a separate cost.
+fn scheme() -> identity::Scheme {
+    identity::Scheme {
+        prefix: PREFIX,
+        via: None,
+        sites: Vec::new(),
+    }
+}
+
 fn pl_header() -> Vec<u8> {
     let vpce = b"vpce-0123456789abcdef0";
     let mut body: Vec<u8> = Vec::new();
@@ -42,6 +51,7 @@ fn bench(name: &str, iters: u64, mut f: impl FnMut(u64) -> u64) {
 }
 
 fn main() {
+    let sc = scheme();
     let hdr = pl_header();
     println!("header = {} bytes", hdr.len());
 
@@ -83,7 +93,7 @@ fn main() {
         let mut s = 0u64;
         for _ in 0..n {
             let h = pp::parse(&hdr).unwrap();
-            s = s.wrapping_add(identity::synthesize(PREFIX, &h)[15] as u64);
+            s = s.wrapping_add(identity::synthesize(&sc, &h)[15] as u64);
         }
         s
     });
@@ -114,7 +124,7 @@ fn main() {
         let mut s = 0u64;
         for _ in 0..n {
             let h = pp::parse(&hdr).unwrap();
-            let a = identity::synthesize(PREFIX, &h);
+            let a = identity::synthesize(&sc, &h);
             s = s.wrapping_add(identity::format(a).as_str().len() as u64);
         }
         s

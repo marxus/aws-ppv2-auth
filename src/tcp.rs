@@ -84,6 +84,9 @@ struct Ppv2Filter {
     refused: bool,
 }
 
+/// Namespace for the access log: %DYNAMIC_METADATA(ppv2_auth:vpce_id)%.
+const META_NS: &str = "ppv2_auth";
+
 enum Decision {
     Label {
         /// Carried beside the text so enforcement never re-parses what it just formatted.
@@ -91,24 +94,77 @@ enum Decision {
         text: identity::AddrText,
         port: u32,
         len: usize,
+        /// What the header attested, for the access log.
+        said: Attested,
     },
     /// Total bytes wanted, not the remainder.
     Need(usize),
     NotProxyProtocol,
 }
 
+/// The two facts the NLB attested, kept so the log can show them beside the identity.
+///
+/// Neither is client-settable: the NLB writes the header and the client's own bytes
+/// begin after it. That is what separates these from the `x-vpce-id` REQUEST header
+/// that used to be logged and was a bypass -- a header is a claim, a TLV is an
+/// observation.
+///
+/// Owned and stack-sized, matching AddrText. `h.vpce` borrows the peek buffer and
+/// `inspect` deliberately lets nothing borrowed escape; a heap allocation per
+/// connection to carry a 22-byte id would be the costliest thing on this path.
+#[derive(Default)]
+struct Attested {
+    /// 32, because a vpce-id is `vpce-` plus 17 hex = 22 bytes, and Default stops
+    /// deriving for arrays above 32 anyway.
+    vpce: [u8; 32],
+    vpce_len: usize,
+    src: [u8; 16],
+    is_v6: bool,
+}
+
+impl Attested {
+    fn of(h: &ppv2::Header) -> Attested {
+        let mut a = Attested {
+            src: h.src,
+            is_v6: h.is_v6,
+            ..Default::default()
+        };
+        // Truncate rather than reject: a real vpce-id is 22 bytes, and a log field
+        // is not worth failing a connection over.
+        let n = h.vpce.len().min(a.vpce.len());
+        a.vpce[..n].copy_from_slice(&h.vpce[..n]);
+        a.vpce_len = n;
+        a
+    }
+
+    /// Empty when the traffic did not come through an endpoint, which is itself the signal.
+    fn vpce(&self) -> &str {
+        // Only ever ASCII from AWS; a non-UTF8 id logs empty rather than panicking.
+        std::str::from_utf8(&self.vpce[..self.vpce_len]).unwrap_or("")
+    }
+
+    /// The source as the header gave it, which the identity may not carry: a site
+    /// matched by NAT prefix zeroes the low 32 bits, and `peer=` is the load
+    /// balancer rather than the client, so without this the client's own address
+    /// appears nowhere.
+    fn src(&self) -> identity::AddrText {
+        identity::format_src(self.src, self.is_v6)
+    }
+}
+
 /// Read the buffer, parse, synthesize.
-fn inspect<ELF: EnvoyListenerFilter>(envoy: &ELF, prefix: identity::Prefix) -> Decision {
+fn inspect<ELF: EnvoyListenerFilter>(envoy: &ELF, scheme: &identity::Scheme) -> Decision {
     let chunk = envoy.get_buffer_chunk();
     let buf = chunk.as_ref().map(|c| c.as_slice()).unwrap_or(&[]);
     match ppv2::parse(buf) {
         Ok(h) => {
-            let addr = identity::synthesize(prefix, &h);
+            let addr = identity::synthesize(scheme, &h);
             Decision::Label {
                 id: identity::to_u128(addr),
                 text: identity::format(addr),
                 port: h.src_port as u32,
                 len: h.len,
+                said: Attested::of(&h),
             }
         }
         Err(ppv2::Error::Need(n)) => Decision::Need(n),
@@ -147,12 +203,12 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
             return Status::Continue;
         }
         // Unreachable: lib.rs rejects a config without `ula`.
-        let Some(prefix) = self.cfg.prefix else {
+        let Some(scheme) = &self.cfg.scheme else {
             return self.refuse(envoy, "missing_ula");
         };
 
         // The buffer borrow ends here; carry out owned values only.
-        match inspect(envoy, prefix) {
+        match inspect(envoy, scheme) {
             Decision::Need(n) => {
                 self.want = n;
                 Status::StopIteration
@@ -167,11 +223,17 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
                 text,
                 port,
                 len,
+                said,
             } => {
                 // is_ipv6 always true; a failure cannot be retried, so refuse rather than stall.
                 if !envoy.set_remote_address(text.as_str(), port, true) {
                     return self.refuse(envoy, "set_remote_address_failed");
                 }
+                // What the NLB attested, for the log. Before the deny branch, so a
+                // refused connection is attributable too -- the case where knowing
+                // who called matters most.
+                envoy.set_dynamic_metadata_string(META_NS, "vpce_id", said.vpce());
+                envoy.set_dynamic_metadata_string(META_NS, "src", said.src().as_str());
                 // Label and strip before judging, so the access log shows what was judged.
                 envoy.drain_buffer(len);
                 if self.enforce && !self.cfg.permits_unscoped(id) {

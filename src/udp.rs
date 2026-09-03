@@ -53,7 +53,7 @@ enum Decision {
 impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
     fn on_data(&mut self, envoy: &mut ELF) -> Status {
         // Unreachable: lib.rs rejects a UDP config without `ula`. Deny anyway.
-        let Some(prefix) = self.cfg.prefix else {
+        let Some(scheme) = &self.cfg.scheme else {
             return Status::StopIteration;
         };
         // Single chunk (every real NLB datagram) borrows in place; multi-chunk joins.
@@ -76,7 +76,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
             // Datagrams are self-contained: a short one is simply not PPv2.
             match ppv2::parse(buf) {
                 Ok(h) => {
-                    let addr = identity::synthesize(prefix, &h);
+                    let addr = identity::synthesize(scheme, &h);
                     if self.cfg.permits_unscoped(identity::to_u128(addr)) {
                         self.payload.clear();
                         self.payload.extend_from_slice(&buf[h.len..]);

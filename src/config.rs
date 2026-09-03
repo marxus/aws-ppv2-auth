@@ -30,11 +30,13 @@
 
 use crate::{cidr, identity};
 use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug)]
 pub struct Config {
     /// Present iff this filter parses PPv2 itself; `auth` has none and reads the label.
-    pub prefix: Option<identity::Prefix>,
+    pub scheme: Option<identity::Scheme>,
     /// Used when `scopes` is absent.
     pub allow: cidr::Set,
     /// None = flat-list mode. Some([]) = SNI mode, nothing claimed, deny all -- the appendable base state.
@@ -128,6 +130,14 @@ impl Config {
 #[serde(deny_unknown_fields)]
 struct Raw {
     ula: Option<String>,
+    /// Tailscale's 4via6 /64. Without it there is no site space and everything uses `ula`.
+    via: Option<String>,
+    /// site id -> the vpce-ids and source prefixes that resolve to it.
+    ///
+    /// BTreeMap, so iteration is ordered and a config that round-trips reads the
+    /// same twice. JSON object keys are strings, so the id is parsed here.
+    #[serde(default)]
+    sites: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     allow: Vec<String>,
     scopes: Option<Vec<RawScope>>,
@@ -146,12 +156,88 @@ fn build(list: &[String]) -> Result<cidr::Set, String> {
     cidr::build_from(list.iter().map(|s| s.as_str())).map_err(str::to_string)
 }
 
+/// A site member is a vpce-id or a source prefix, told apart the way the CRs do it:
+/// try to read it as an address, and treat what is left as an opaque id.
+///
+/// IPv4 becomes ::ffff:a.b.c.d/(96+N) so one cidr::Set covers both families --
+/// cidr::build parses IPv6 only, and it requires an explicit width, so a bare
+/// address is normalized to /128 rather than rejected.
+fn classify(member: &str) -> Result<Option<String>, String> {
+    let (addr, width) = match member.split_once('/') {
+        Some((a, w)) => (
+            a,
+            Some(
+                w.parse::<u8>()
+                    .map_err(|_| format!("bad prefix length in site member {member:?}"))?,
+            ),
+        ),
+        None => (member, None),
+    };
+    if let Ok(v4) = addr.parse::<Ipv4Addr>() {
+        let bits = width.unwrap_or(32);
+        if bits > 32 {
+            return Err(format!("prefix length above /32 in site member {member:?}"));
+        }
+        return Ok(Some(format!("::ffff:{v4}/{}", 96 + bits)));
+    }
+    if let Ok(v6) = addr.parse::<Ipv6Addr>() {
+        return Ok(Some(format!("{v6}/{}", width.unwrap_or(128))));
+    }
+    // Not an address, so it is an endpoint id.
+    Ok(None)
+}
+
+fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>, String> {
+    raw.into_iter()
+        .map(|(key, members)| {
+            // 0 is not reserved for anything, but tailscale renders it as the bare
+            // prefix, which reads as "no site" -- so refuse it rather than emit it.
+            let id: u16 = key
+                .parse()
+                .map_err(|_| format!("site key {key:?} is not a number in 1..=65535"))?;
+            if id == 0 {
+                return Err("site 0 is not usable: it renders as the bare via prefix".to_string());
+            }
+            let mut vpce = Vec::new();
+            let mut prefixes = Vec::new();
+            for m in &members {
+                match classify(m)? {
+                    Some(cidr_text) => prefixes.push(cidr_text),
+                    None => vpce.push(m.as_bytes().to_vec().into_boxed_slice()),
+                }
+            }
+            Ok(identity::Site {
+                id,
+                vpce,
+                cidrs: build(&prefixes)?,
+            })
+        })
+        .collect()
+}
+
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: Raw = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
-    let prefix = match &raw.ula {
-        Some(u) => Some(identity::parse_prefix(u).map_err(str::to_string)?),
-        None => None,
+    // `via` and `sites` belong to whoever owns `ula`: they only matter to a filter
+    // that parses the header itself, and the validators enforce that.
+    let scheme = match &raw.ula {
+        Some(u) => Some(identity::Scheme {
+            prefix: identity::parse_prefix(u).map_err(str::to_string)?,
+            via: match &raw.via {
+                Some(v) => Some(identity::parse_via_prefix(v).map_err(str::to_string)?),
+                None => None,
+            },
+            sites: build_sites(raw.sites)?,
+        }),
+        None => {
+            if raw.via.is_some() || !raw.sites.is_empty() {
+                return Err(
+                    "`via` and `sites` need `ula`; they describe how a header is encoded"
+                        .to_string(),
+                );
+            }
+            None
+        }
     };
     let allow = build(&raw.allow)?;
     let scopes = match raw.scopes {
@@ -169,7 +255,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     };
 
     Ok(Config {
-        prefix,
+        scheme,
         allow,
         scopes,
     })

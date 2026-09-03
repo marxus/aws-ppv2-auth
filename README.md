@@ -25,29 +25,60 @@ the whole job itself.
 Every policy engine here matches addresses — Envoy RBAC, `CiliumNetworkPolicy` —
 and none can match a `vpce-id`. So synthesize one:
 
+An **onboarded** tenant — one the `sites` table names — gets a real Tailscale
+4via6 address, so the same value reads as identity here and as a route there:
+
 ```text
-fd00:dead:beef : 0001 : 7b53:e75b:6e3d:cfdb
-└── /48 ULA ──┘  └kind┘  └── 64-bit body ──┘
-                    1 = sha256(vpce-id) truncated
-                    4 = 4via6, client IPv4 in the low 32 bits
+fd7a:115c:a1e0:b1a : 0000 : 0007 : 0a00:011c
+└──── via /64 ────┘  zero   site   client IPv4
 ```
 
-Derived, not mapped, so the data plane holds no tenant knowledge — adding a
-tenant is one policy rule. Reproduce any value with
-`printf %s vpce-0123456789abcdef0 | sha256sum | cut -c1-16`.
+Verified bit-identical to `tailscale debug via 7 10.0.1.28/32`. The site sits in
+group 6 and the IPv4 in the low 32 bits, which is RFC 6052 embedding for the
+`<via>:0:<site>::/96` that CoreDNS's `dns64` plugin already declares — so the
+encoding is the standard one rather than a private invention.
+
+Anyone else lands in the fallback ULA, derived rather than looked up, so the data
+plane holds no knowledge of a stranger:
+
+```text
+fd00:dead:beef : 0001 : 7b53:e75b : 0a00:011c
+└── /48 ULA ──┘  └kind┘  └ hash ─┘  client IPv4
+                    1 = sha256(vpce-id), an un-onboarded tenant
+                    4 = no vpce-id, so the hash half is zero
+```
+
+Reproduce a hash with
+`printf %s vpce-0123456789abcdef0 | sha256sum | cut -c1-8`.
 
 | header says | result |
 |---|---|
-| a `vpce-id` is present | kind 1, `sha256(id)` |
+| resolves to a site, by `vpce-id` | `via` + site + the tenant's own IPv4 |
+| resolves to a site, by source prefix | `via` + site, low 32 bits **zero** |
+| a `vpce-id` no site claims | kind 1, `sha256(id)` + client IPv4 |
 | no `vpce-id`, IPv4 client | kind 4, 4via6 |
 | no `vpce-id`, IPv6 client | **passed through unchanged** |
 
 A v6 client already *is* an address, so encoding could only lose information.
-The invariant: everything inside the ULA `/48` was synthesized here, everything
-outside it is a real client address.
+The invariant: everything inside one of the two configured prefixes was
+synthesized here, everything outside them is a real client address.
 
-Two coarse rules fall out of the kind nibble — `…:1::/64` is any tenant,
-`…:4::/64` is any IPv4 client — and an IPv4 `/N` maps onto `/(96+N)`.
+**Why a source prefix carries no machine.** Through PrivateLink the header holds
+the tenant's own address — measured, the NLB reports the consumer-side 5-tuple —
+so it is theirs and worth carrying. Over the internet their NAT already rewrote
+it, so the address is not in their space at all; zero reads honestly as "this
+tenant, machine unknown" and still sits inside the tenant's own `/96`. The real
+source is in the access log either way.
+
+**Trust is split within one address, and that is worth knowing before writing a
+rule.** The site or hash half comes from an AWS-assigned id the sender cannot
+choose. The low 32 bits are whatever their machine put in its own packets. So a
+`/96` rule naming a tenant is a boundary; a `/128` naming one of their machines
+is a convenience, and not something to lean on against that tenant.
+
+Two coarse rules still fall out of the kind group — `…:1::/64` is any
+un-onboarded tenant, `…:4::/64` is any IPv4 client — and an IPv4 `/N` maps onto
+`/(96+N)`.
 
 The address is a label, not a route. Nothing is ever sent from it, so there is no
 spoofing concern and nothing for a CNI's source-IP verification to reject.
@@ -66,7 +97,7 @@ depth:
 ```yaml
 principal:
   clientCIDRs:
-    - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128   # one tenant
+    - fd00:dead:beef:1:7b53:e75b:a00:11c/128   # one tenant, one machine
     - fd00:dead:beef:4::12c7:0/112               # 18.199.0.0/16
 ```
 
@@ -104,7 +135,7 @@ filter_config:
           - l7.mgmt.test
           - "*.pass.mgmt.test"     # quote it: YAML reads a leading * as an alias
         allow:
-          - fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128
+          - fd00:dead:beef:1:7b53:e75b:a00:11c/128
 ```
 
 A scope may name **several hostnames** sharing one list — the shape Envoy's
@@ -117,6 +148,31 @@ Each filter takes one config shape, and anything else fails the listener:
 | `ppv2_auth` | `ula` + `allow` | the whole job in one — plain TCP, and UDP |
 | `ppv2` | `ula` only | synthesize and label; it never denies, so it takes no rules |
 | `auth` | `scopes` | read the label a `ppv2` filter left — the TLS chain |
+
+`via` and `sites` are optional and belong wherever `ula` does: they describe how a
+header is encoded, and only a filter that parses the header does that. On `auth`
+they are rejected, because there they would read as applied and do nothing.
+
+```yaml
+    ula: fd00:dead:beef::/48
+    via: fd7a:115c:a1e0:b1a::/64        # tailscale's 4via6 range, a /64 not a /48
+    sites:
+      "1": [vpce-028ff61de1d1fea8c, 3.126.239.93/32]
+      "2": [203.0.113.0/24, 198.51.100.7/32]
+```
+
+A site member is a `vpce-id` or a source prefix, told apart by trying to read it
+as an address. IPv4 is lifted to `::ffff:a.b.c.d/(96+N)` so one matcher covers
+both families, and a bare address means a single host. A `vpce-id` outranks a
+prefix: AWS assigned it and the sender cannot choose it.
+
+Site ids are 1..=65535 — the field is 16 bits, and 0 renders as the bare `via`
+prefix, so it is refused. Overlapping prefixes across sites are **not** detected
+here; keep them disjoint where the table is generated, or which site wins depends
+on iteration order.
+
+Without `via` there is no site space and everything falls to `ula`, which is what
+this module did before v0.6.0.
 
 The split exists only because TLS forces it: `auth` needs the SNI, which exists
 only after `tls_inspector`, and `tls_inspector` cannot find a ClientHello until
@@ -142,7 +198,7 @@ operation:
   path: /listener_filters/2/typed_config/filter_config/value/scopes/-
   value:
     sni: [tenant-a.mgmt.test]
-    allow: [fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128]
+    allow: [fd00:dead:beef:1:7b53:e75b:a00:11c/128]
 ```
 
 Several policies may target one Gateway — verified on EG v1.9.1 — and they apply
@@ -180,6 +236,28 @@ literal strings rather than rejected, so they never match a real SNI — erring
 toward deny rather than failing the config.
 
 ## Observability
+
+The parsed header is published as dynamic metadata, so an access log can show
+who called beside what was judged:
+
+```yaml
+    text: "src=%DOWNSTREAM_REMOTE_ADDRESS% tenant=%DYNAMIC_METADATA(ppv2_auth:vpce_id)% from=%DYNAMIC_METADATA(ppv2_auth:src)%"
+```
+
+`vpce_id` is the TLV the load balancer wrote and `src` is the source the header
+gave. Neither is client-settable — the NLB writes the header and the client's own
+bytes begin after it — which is what separates them from an `x-vpce-id` REQUEST
+header, a claim that was once logged here and was a bypass. Both are set before
+the deny branch, so a refused connection is attributable too.
+
+`src` matters most where the identity cannot carry it: a site matched by NAT
+prefix zeroes the low 32 bits, and `%DOWNSTREAM_DIRECT_REMOTE_ADDRESS%` is the
+load balancer rather than the client, so without this field the caller's own
+address appears nowhere.
+
+**UDP has neither.** The dynamic-modules UDP ABI exposes no metadata or filter
+state, so there the counters remain the only signal.
+
 
 A refused TCP connection is closed with no bytes sent (the client sees a reset),
 and Envoy emits a **listener-level access log** entry for it — EG configures those
