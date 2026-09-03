@@ -1,7 +1,7 @@
 //! filter_config parsing, and the fail-closed choices that depend on it.
 
-use aws_ppv2_identity::config::Pattern;
-use aws_ppv2_identity::{config, identity, validate_auth, validate_ppv2, validate_ppv2_auth};
+use aws_ppv2_auth::config::Pattern;
+use aws_ppv2_auth::{config, identity, validate_auth, validate_ppv2, validate_ppv2_auth};
 
 fn ip(s: &str) -> u128 {
     identity::to_u128(s.parse::<std::net::Ipv6Addr>().unwrap().octets())

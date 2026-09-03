@@ -1,6 +1,6 @@
 //! Pure-logic benchmark: 112-byte PrivateLink header, 10,000-entry allowlist,
 //! worst-case lookup (last entry).
-use aws_ppv2_identity::{cidr, identity, ppv2 as pp};
+use aws_ppv2_auth::{cidr, identity, ppv2 as pp};
 use std::time::Instant;
 
 const PREFIX: identity::Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];

@@ -1,4 +1,4 @@
-# aws-ppv2-identity
+# aws-ppv2-auth
 
 An Envoy dynamic module that turns AWS PROXY protocol v2 identity into an
 **IPv6 address**, so ordinary `clientCIDRs` rules can express PrivateLink tenant
@@ -79,10 +79,10 @@ ConfigMap:
 ```yaml
 pod:
   volumes:
-    - name: aws-ppv2-identity
-      image: { reference: ghcr.io/marxus/aws-ppv2-identity:0.5.0 }
+    - name: aws-ppv2-auth
+      image: { reference: ghcr.io/marxus/aws-ppv2-auth:0.5.0 }
 container:
-  volumeMounts: [{ name: aws-ppv2-identity, mountPath: /modules, readOnly: true }]
+  volumeMounts: [{ name: aws-ppv2-auth, mountPath: /modules, readOnly: true }]
   env: [{ name: LD_LIBRARY_PATH, value: /modules }]
 ```
 
@@ -266,7 +266,7 @@ module.
 ```sh
 cargo test
 cargo run --release --example bench
-docker build -t aws-ppv2-identity .
+docker build -t aws-ppv2-auth .
 ```
 
 A host build on macOS needs the `dynamic_lookup` flag already in

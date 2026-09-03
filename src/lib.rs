@@ -60,7 +60,7 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
         }
         _ => {
             eprintln!(
-                "aws-ppv2-identity: unknown filter_name {name:?}; expected ppv2_auth, ppv2 or auth"
+                "aws-ppv2-auth: unknown filter_name {name:?}; expected ppv2_auth, ppv2 or auth"
             );
             None
         }
@@ -74,7 +74,7 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
     if name != "ppv2_auth" {
         // The UDP ABI has no way to hand an identity onward, so UDP is one filter.
-        eprintln!("aws-ppv2-identity: UDP supports only filter_name ppv2_auth, got {name:?}");
+        eprintln!("aws-ppv2-auth: UDP supports only filter_name ppv2_auth, got {name:?}");
         return None;
     }
     let cfg = load(config_bytes, validate_ppv2_auth)?;
@@ -106,7 +106,7 @@ fn load(
     match parsed {
         Ok(cfg) => Some(Arc::new(cfg)),
         Err(e) => {
-            eprintln!("aws-ppv2-identity: bad filter_config: {e}");
+            eprintln!("aws-ppv2-auth: bad filter_config: {e}");
             None
         }
     }

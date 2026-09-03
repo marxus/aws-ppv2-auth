@@ -33,7 +33,7 @@ RUN case "$TARGETARCH" in \
     cargo zigbuild --release --locked --target "$TRIPLE" && \
     # Envoy loads lib<name>.so and Envoy Gateway's module name may not contain
     # an underscore, which is what Rust emits. Rename once, here.
-    cp "target/$TRIPLE/release/libaws_ppv2_identity.so" /libaws-ppv2-identity.so
+    cp "target/$TRIPLE/release/libaws_ppv2_auth.so" /libaws-ppv2-auth.so
 
 FROM scratch
-COPY --from=build /libaws-ppv2-identity.so /libaws-ppv2-identity.so
+COPY --from=build /libaws-ppv2-auth.so /libaws-ppv2-auth.so

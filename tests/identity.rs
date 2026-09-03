@@ -1,10 +1,10 @@
 //! Address synthesis: the three ordered cases, and the invariant that
 //! everything synthesized lands inside the ULA /48 and nothing else does.
 
-use aws_ppv2_identity::identity::{
+use aws_ppv2_auth::identity::{
     self, format, parse_prefix, synthesize, Prefix, KIND_VIA4, KIND_VPCE,
 };
-use aws_ppv2_identity::ppv2;
+use aws_ppv2_auth::ppv2;
 use std::net::Ipv6Addr;
 
 const TEST_PREFIX: Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];

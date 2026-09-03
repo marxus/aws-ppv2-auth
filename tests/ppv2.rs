@@ -2,7 +2,7 @@
 
 mod common;
 
-use aws_ppv2_identity::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
+use aws_ppv2_auth::ppv2::{self, Error, AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
 use common::{build, V2_PROXY};
 
 #[test]

@@ -4,7 +4,7 @@
 //! in tests/ as its own test binary, and a subdirectory module is the standard
 //! way to share code without producing an empty one.
 
-use aws_ppv2_identity::ppv2::{AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
+use aws_ppv2_auth::ppv2::{AWS_SUBTYPE_VPCE_ID, SIGNATURE, TLV_AWS};
 
 /// Version 2 + PROXY. The only 13th byte an NLB ever sends. Written literally
 /// rather than imported from the parser: what is under test is the byte on the
