@@ -30,7 +30,6 @@
 
 use crate::{cidr, identity};
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug)]
@@ -132,20 +131,25 @@ struct Raw {
     ula: Option<String>,
     /// Tailscale's 4via6 /64. Without it there is no site space and everything uses `ula`.
     via: Option<String>,
-    /// site id -> the vpce-ids and source prefixes that resolve to it, comma-separated.
+    /// The tenant table: an id, and the vpce-ids and source prefixes that resolve to it.
     ///
-    /// CSV rather than an array because the table is a ConfigMap, whose values are
-    /// strings, and CEL cannot build a map from a comprehension -- so kro passes
-    /// `.data` straight through and nothing has to reshape it. cidr::build already
-    /// speaks the same comma-separated form.
-    ///
-    /// BTreeMap, so iteration is ordered and a config that round-trips reads the
-    /// same twice. JSON object keys are strings, so the id is parsed here.
+    /// A LIST OF OBJECTS, not a map keyed by id, and that is a constraint from the
+    /// generator rather than a preference: CEL can build a list from a
+    /// comprehension but not a map, so a ConfigMap of id -> text can be reshaped
+    /// into this and not into the other.
     #[serde(default)]
-    sites: BTreeMap<String, String>,
+    sites: Vec<RawSite>,
     #[serde(default)]
     allow: Vec<String>,
     scopes: Option<Vec<RawScope>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSite {
+    id: u16,
+    #[serde(default)]
+    members: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -192,28 +196,38 @@ fn classify(member: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-fn build_sites(raw: BTreeMap<String, String>) -> Result<Vec<identity::Site>, String> {
+fn build_sites(raw: Vec<RawSite>) -> Result<Vec<identity::Site>, String> {
+    let mut seen: Vec<u16> = Vec::new();
     raw.into_iter()
-        .map(|(key, csv)| {
+        .map(|site| {
             // 0 is not reserved for anything, but tailscale renders it as the bare
             // prefix, which reads as "no site" -- so refuse it rather than emit it.
-            let id: u16 = key
-                .parse()
-                .map_err(|_| format!("site key {key:?} is not a number in 1..=65535"))?;
-            if id == 0 {
+            if site.id == 0 {
                 return Err("site 0 is not usable: it renders as the bare via prefix".to_string());
             }
+            // Two entries for one id would make which members apply depend on order.
+            if seen.contains(&site.id) {
+                return Err(format!("site {} appears twice", site.id));
+            }
+            seen.push(site.id);
+
             let mut vpce = Vec::new();
             let mut prefixes = Vec::new();
-            // Empty entries dropped so a trailing comma is not a member named "".
-            for m in csv.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            // Trimmed and empties dropped: the generator splits a text block, so a
+            // trailing newline would otherwise become a member named "".
+            for m in site
+                .members
+                .iter()
+                .map(|m| m.trim())
+                .filter(|m| !m.is_empty())
+            {
                 match classify(m)? {
                     Some(cidr_text) => prefixes.push(cidr_text),
                     None => vpce.push(m.as_bytes().to_vec().into_boxed_slice()),
                 }
             }
             Ok(identity::Site {
-                id,
+                id: site.id,
                 vpce,
                 cidrs: build(&prefixes)?,
             })

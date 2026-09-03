@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "ppv2-auth"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "envoy-proxy-dynamic-modules-rust-sdk",
  "serde",
