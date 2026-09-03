@@ -23,23 +23,54 @@ type Status = abi::envoy_dynamic_module_type_on_listener_filter_status;
 
 // --- ppv2 / ppv2_auth: parse, label, drain, maybe enforce --------------------
 
+/// Counter ids, resolved once at listener build. None means metrics registration
+/// failed or was skipped -- never a reason to fail the listener.
+#[derive(Clone, Copy, Default)]
+pub struct Counters {
+    pub allowed: Option<EnvoyCounterId>,
+    pub denied: Option<EnvoyCounterId>,
+    pub not_ppv2: Option<EnvoyCounterId>,
+}
+
+impl Counters {
+    pub fn register<EC: EnvoyListenerFilterConfig>(ec: &mut EC) -> Counters {
+        Counters {
+            allowed: ec.define_counter("allowed").ok(),
+            denied: ec.define_counter("denied").ok(),
+            not_ppv2: ec.define_counter("not_ppv2").ok(),
+        }
+    }
+}
+
+fn bump<ELF: EnvoyListenerFilter>(envoy: &ELF, id: Option<EnvoyCounterId>) {
+    if let Some(id) = id {
+        let _ = envoy.increment_counter(id, 1);
+    }
+}
+
 pub struct Ppv2Config {
     cfg: Arc<config::Config>,
     /// Fixed by filter_name at listener build, never read from config -- it cannot drift.
     enforce: bool,
+    counters: Counters,
 }
 
 impl Ppv2Config {
     /// `ppv2_auth`: label, then judge against the flat allowlist.
-    pub fn enforcing(cfg: Arc<config::Config>) -> Ppv2Config {
-        Ppv2Config { cfg, enforce: true }
+    pub fn enforcing(cfg: Arc<config::Config>, counters: Counters) -> Ppv2Config {
+        Ppv2Config {
+            cfg,
+            enforce: true,
+            counters,
+        }
     }
 
     /// `ppv2`: label and drain only; a later `auth` filter judges.
-    pub fn labelling(cfg: Arc<config::Config>) -> Ppv2Config {
+    pub fn labelling(cfg: Arc<config::Config>, counters: Counters) -> Ppv2Config {
         Ppv2Config {
             cfg,
             enforce: false,
+            counters,
         }
     }
 }
@@ -50,6 +81,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for Ppv2Config {
         Box::new(Ppv2Filter {
             cfg: self.cfg.clone(),
             enforce: self.enforce,
+            counters: self.counters,
             // Ceiling up front: `want` never grows, so one buffer alloc and one on_data.
             want: ppv2::MAX_HEADER,
             done: false,
@@ -61,6 +93,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for Ppv2Config {
 struct Ppv2Filter {
     cfg: Arc<config::Config>,
     enforce: bool,
+    counters: Counters,
     /// TOTAL bytes from connection start, not the remainder -- Envoy peeks, never consumes.
     want: usize,
     /// Terminal and asymmetric: `done` admits, `refused` can never later admit.
@@ -102,8 +135,11 @@ fn inspect<ELF: EnvoyListenerFilter>(envoy: &ELF, prefix: identity::Prefix) -> D
 
 impl Ppv2Filter {
     /// Close the socket, setting the terminal flag so no call site can forget it.
-    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF) -> Status {
+    /// `reason` shows as %DOWNSTREAM_TRANSPORT_FAILURE_REASON% in the listener
+    /// access log -- underscore tokens, since the formatter folds spaces anyway.
+    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF, reason: &str) -> Status {
         self.refused = true;
+        envoy.set_downstream_transport_failure_reason(reason);
         envoy.continue_filter_chain(false);
         Status::StopIteration
     }
@@ -129,7 +165,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
         }
         // Unreachable: lib.rs rejects a config without `ula`.
         let Some(prefix) = self.cfg.prefix else {
-            return self.refuse(envoy);
+            return self.refuse(envoy, "missing_ula");
         };
 
         // The buffer borrow ends here; carry out owned values only.
@@ -139,7 +175,10 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
                 Status::StopIteration
             }
             // No header means the client reached the listener directly.
-            Decision::NotProxyProtocol => self.refuse(envoy),
+            Decision::NotProxyProtocol => {
+                bump(envoy, self.counters.not_ppv2);
+                self.refuse(envoy, "not_proxy_protocol")
+            }
             Decision::Label {
                 id,
                 text,
@@ -148,13 +187,15 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
             } => {
                 // is_ipv6 always true; a failure cannot be retried, so refuse rather than stall.
                 if !envoy.set_remote_address(text.as_str(), port, true) {
-                    return self.refuse(envoy);
+                    return self.refuse(envoy, "set_remote_address_failed");
                 }
                 // Label and strip before judging, so the access log shows what was judged.
                 envoy.drain_buffer(len);
                 if self.enforce && !self.cfg.permits_unscoped(id) {
-                    return self.refuse(envoy);
+                    bump(envoy, self.counters.denied);
+                    return self.refuse(envoy, "denied_by_allowlist");
                 }
+                bump(envoy, self.counters.allowed);
                 self.done = true;
                 Status::Continue
             }
@@ -166,12 +207,14 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
 
 pub struct AuthConfig {
     pub cfg: Arc<config::Config>,
+    pub counters: Counters,
 }
 
 impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for AuthConfig {
     fn new_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn ListenerFilter<ELF>> {
         Box::new(AuthFilter {
             cfg: self.cfg.clone(),
+            counters: self.counters,
             settled: false,
         })
     }
@@ -179,13 +222,15 @@ impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for AuthConfig {
 
 struct AuthFilter {
     cfg: Arc<config::Config>,
+    counters: Counters,
     /// Terminal either way: this filter admits or closes, never both.
     settled: bool,
 }
 
 impl AuthFilter {
-    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF) -> Status {
+    fn refuse<ELF: EnvoyListenerFilter>(&mut self, envoy: &mut ELF, reason: &str) -> Status {
         self.settled = true;
+        envoy.set_downstream_transport_failure_reason(reason);
         envoy.continue_filter_chain(false);
         Status::StopIteration
     }
@@ -197,7 +242,8 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
         self.settled = true;
         let Some(id) = labelled_identity(envoy) else {
             // No label means no `ppv2` filter ran ahead of us.
-            return self.refuse(envoy);
+            bump(envoy, self.counters.denied);
+            return self.refuse(envoy, "no_identity_label");
         };
         let permitted = {
             let sni = envoy.get_requested_server_name();
@@ -205,9 +251,11 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
             self.cfg.permits(sni, id)
         };
         if permitted {
+            bump(envoy, self.counters.allowed);
             Status::Continue
         } else {
-            self.refuse(envoy)
+            bump(envoy, self.counters.denied);
+            self.refuse(envoy, "denied_by_allowlist")
         }
     }
 
@@ -221,7 +269,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
         if self.settled {
             return Status::StopIteration;
         }
-        self.refuse(envoy)
+        self.refuse(envoy, "unexpected_on_data")
     }
 }
 

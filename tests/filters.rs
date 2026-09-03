@@ -18,22 +18,30 @@ const ULA: &str = r#""ula":"fd00:dead:beef::/48""#;
 const TENANT: &str = r#""allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128"]"#;
 
 fn ppv2_config(text: &str) -> tcp::Ppv2Config {
-    tcp::Ppv2Config::labelling(Arc::new(config::parse(text).unwrap()))
+    tcp::Ppv2Config::labelling(
+        Arc::new(config::parse(text).unwrap()),
+        tcp::Counters::default(),
+    )
 }
 
 fn ppv2_auth_config(text: &str) -> tcp::Ppv2Config {
-    tcp::Ppv2Config::enforcing(Arc::new(config::parse(text).unwrap()))
+    tcp::Ppv2Config::enforcing(
+        Arc::new(config::parse(text).unwrap()),
+        tcp::Counters::default(),
+    )
 }
 
 fn auth_config(text: &str) -> tcp::AuthConfig {
     tcp::AuthConfig {
         cfg: Arc::new(config::parse(text).unwrap()),
+        counters: tcp::Counters::default(),
     }
 }
 
 fn udp_config(text: &str) -> udp::Ppv2AuthConfig {
     udp::Ppv2AuthConfig {
         cfg: Arc::new(config::parse(text).unwrap()),
+        counters: udp::Counters::default(),
     }
 }
 
@@ -57,6 +65,9 @@ fn a_refused_connection_is_not_admitted_by_a_later_on_data() {
         .expect_get_buffer_chunk()
         .returning(|| Some(EnvoyBuffer::new(b"GET ")));
     // The actual reject mechanism, and it must fire exactly once.
+    envoy
+        .expect_set_downstream_transport_failure_reason()
+        .returning(|_| ());
     envoy
         .expect_continue_filter_chain()
         .withf(|success| !success)
@@ -83,6 +94,9 @@ fn non_ppv2_traffic_is_refused_unconditionally() {
         envoy
             .expect_get_buffer_chunk()
             .returning(|| Some(EnvoyBuffer::new(b"GET / HTTP/1.1\r\n\r\n")));
+        envoy
+            .expect_set_downstream_transport_failure_reason()
+            .returning(|_| ());
         envoy
             .expect_continue_filter_chain()
             .withf(|success| !success)
@@ -130,6 +144,9 @@ fn ppv2_auth_enforces_the_flat_list_after_labelling() {
     // Still labelled and stripped, so the access log shows what was judged.
     envoy.expect_set_remote_address().returning(|_, _, _| true);
     envoy.expect_drain_buffer().returning(|_| ());
+    envoy
+        .expect_set_downstream_transport_failure_reason()
+        .returning(|_| ());
     envoy
         .expect_continue_filter_chain()
         .withf(|success| !success)
@@ -316,6 +333,9 @@ fn auth_denies_an_sni_that_no_scope_claims() {
     let fc = auth_config(SCOPED);
     let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb", b"other.mgmt.test");
     envoy
+        .expect_set_downstream_transport_failure_reason()
+        .returning(|_| ());
+    envoy
         .expect_continue_filter_chain()
         .withf(|success| !success)
         .times(1)
@@ -329,6 +349,9 @@ fn auth_denies_an_sni_that_no_scope_claims() {
 fn auth_denies_an_unlisted_identity_on_a_matching_sni() {
     let fc = auth_config(SCOPED);
     let mut envoy = labelled("fd00:dead:beef:1:ffff:ffff:ffff:ffff", b"l7.mgmt.test");
+    envoy
+        .expect_set_downstream_transport_failure_reason()
+        .returning(|_| ());
     envoy
         .expect_continue_filter_chain()
         .withf(|success| !success)
@@ -345,6 +368,9 @@ fn auth_denies_when_there_is_no_sni_at_all() {
     let fc = auth_config(SCOPED);
     let mut envoy = labelled("fd00:dead:beef:1:7b53:e75b:6e3d:cfdb", b"");
     envoy
+        .expect_set_downstream_transport_failure_reason()
+        .returning(|_| ());
+    envoy
         .expect_continue_filter_chain()
         .withf(|success| !success)
         .times(1)
@@ -360,6 +386,9 @@ fn auth_denies_when_no_preceding_filter_labelled_the_socket() {
     let fc = auth_config(SCOPED);
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy.expect_get_remote_address().returning(|| None);
+    envoy
+        .expect_set_downstream_transport_failure_reason()
+        .returning(|_| ());
     envoy
         .expect_continue_filter_chain()
         .withf(|success| !success)
@@ -380,4 +409,103 @@ fn auth_never_reads_bytes() {
     let mut f = fc.new_listener_filter(&mut envoy);
     assert_eq!(f.on_accept(&mut envoy), TcpStatus::Continue);
     assert_eq!(f.max_read_bytes(&mut envoy), 0);
+}
+
+// --- observability -----------------------------------------------------------
+
+#[test]
+fn refusals_carry_a_failure_reason_and_bump_the_denied_counter() {
+    // The reason is the only "why" the listener access log gets; the counter is
+    // the only signal at all on UDP. Underscore tokens, because the formatter
+    // folds spaces to underscores anyway (stream_info_formatter.cc:2289).
+    let fc = tcp::AuthConfig {
+        cfg: Arc::new(config::parse(SCOPED).unwrap()),
+        counters: tcp::Counters {
+            denied: Some(EnvoyCounterId(7)),
+            ..Default::default()
+        },
+    };
+    let mut envoy = labelled("fd00:dead:beef:1:ffff::1", b"l7.mgmt.test");
+    envoy
+        .expect_set_downstream_transport_failure_reason()
+        .withf(|r| r == "denied_by_allowlist")
+        .times(1)
+        .returning(|_| ());
+    envoy
+        .expect_increment_counter()
+        .withf(|id, n| id.0 == 7 && *n == 1)
+        .times(1)
+        .returning(|_, _| Ok(()));
+    envoy
+        .expect_continue_filter_chain()
+        .withf(|success| !success)
+        .times(1)
+        .returning(|_| ());
+
+    let mut f = fc.new_listener_filter(&mut envoy);
+    assert_eq!(f.on_accept(&mut envoy), TcpStatus::StopIteration);
+}
+
+#[test]
+fn non_ppv2_refusal_says_so_and_counts_separately() {
+    let fc = tcp::Ppv2Config::enforcing(
+        Arc::new(config::parse(&format!("{{{ULA}}}")).unwrap()),
+        tcp::Counters {
+            not_ppv2: Some(EnvoyCounterId(9)),
+            ..Default::default()
+        },
+    );
+    let mut envoy = MockEnvoyListenerFilter::new();
+    envoy
+        .expect_get_buffer_chunk()
+        .returning(|| Some(EnvoyBuffer::new(b"GET / HTTP/1.1\r\n\r\n")));
+    envoy
+        .expect_set_downstream_transport_failure_reason()
+        .withf(|r| r == "not_proxy_protocol")
+        .times(1)
+        .returning(|_| ());
+    envoy
+        .expect_increment_counter()
+        .withf(|id, n| id.0 == 9 && *n == 1)
+        .times(1)
+        .returning(|_, _| Ok(()));
+    envoy
+        .expect_continue_filter_chain()
+        .withf(|success| !success)
+        .times(1)
+        .returning(|_| ());
+
+    let mut f = fc.new_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy, 18), TcpStatus::StopIteration);
+}
+
+#[test]
+fn udp_denials_bump_the_only_signal_udp_has() {
+    // No session, no access log, no failure reason on UDP -- the counter is it.
+    let dg = leak(build(
+        V2_PROXY,
+        0x12,
+        &[10, 0, 1, 28],
+        Some(b"vpce-somebody-else"),
+    ));
+    let fc = udp::Ppv2AuthConfig {
+        cfg: Arc::new(config::parse(&format!("{{{ULA},{TENANT}}}")).unwrap()),
+        counters: udp::Counters {
+            denied: Some(EnvoyCounterId(3)),
+            ..Default::default()
+        },
+    };
+    let mut envoy = MockEnvoyUdpListenerFilter::new();
+    envoy
+        .expect_get_datagram_data()
+        .returning(move || (vec![EnvoyBuffer::new(dg)], dg.len()));
+    envoy
+        .expect_increment_counter()
+        .withf(|id, n| id.0 == 3 && *n == 1)
+        .times(1)
+        .returning(|_, _| Ok(()));
+    envoy.expect_set_datagram_data().never();
+
+    let mut f = fc.new_udp_listener_filter(&mut envoy);
+    assert_eq!(f.on_data(&mut envoy), UdpStatus::StopIteration);
 }

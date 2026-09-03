@@ -179,6 +179,28 @@ Only a whole leading `*.` is a wildcard. `foo.*` and `*bla.com` are kept as
 literal strings rather than rejected, so they never match a real SNI — erring
 toward deny rather than failing the config.
 
+## Observability
+
+A refused TCP connection is closed with no bytes sent (the client sees a reset),
+and Envoy emits a **listener-level access log** entry for it — EG configures those
+by default. Because the filter labels before judging, a deny entry shows the
+synthesized identity that was judged; the address class tells you what it was
+(`<ula>:1:…` tenant, `<ula>:4:…` IPv4 client, outside the /48 a real IPv6 client).
+
+`%DOWNSTREAM_TRANSPORT_FAILURE_REASON%` in that entry says why:
+
+| reason | meaning |
+|---|---|
+| `denied_by_allowlist` | parsed and judged; no rule covers the identity |
+| `not_proxy_protocol` | no PPv2 header — reached the listener directly |
+| `no_identity_label` | `auth` ran without a `ppv2` filter ahead of it |
+| `set_remote_address_failed` | internal: Envoy rejected the relabel |
+
+Each filter also defines three counters under its `metrics_namespace`:
+`allowed`, `denied`, `not_ppv2`. On UDP the counters are the **only** signal —
+a denied datagram produces no session, no log, and no failure reason, and is
+otherwise indistinguishable from packet loss.
+
 ## Why the two filters differ
 
 The UDP ABI has 21 callbacks but none can attach an identity to a session, and

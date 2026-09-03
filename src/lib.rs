@@ -37,22 +37,25 @@ fn init() -> bool {
 
 /// None rejects the listener; `name` is the proto's filter_name, how one .so exposes three filters.
 fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerFilter>(
-    _envoy_filter_config: &mut EC,
+    envoy_filter_config: &mut EC,
     name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn ListenerFilterConfig<ELF>>> {
     match name {
         "ppv2_auth" => {
             let cfg = load(config_bytes, validate_ppv2_auth)?;
-            Some(Box::new(tcp::Ppv2Config::enforcing(cfg)))
+            let counters = tcp::Counters::register(envoy_filter_config);
+            Some(Box::new(tcp::Ppv2Config::enforcing(cfg, counters)))
         }
         "ppv2" => {
             let cfg = load(config_bytes, validate_ppv2)?;
-            Some(Box::new(tcp::Ppv2Config::labelling(cfg)))
+            let counters = tcp::Counters::register(envoy_filter_config);
+            Some(Box::new(tcp::Ppv2Config::labelling(cfg, counters)))
         }
         "auth" => {
             let cfg = load(config_bytes, validate_auth)?;
-            Some(Box::new(tcp::AuthConfig { cfg }))
+            let counters = tcp::Counters::register(envoy_filter_config);
+            Some(Box::new(tcp::AuthConfig { cfg, counters }))
         }
         _ => {
             eprintln!(
@@ -64,7 +67,7 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
 }
 
 fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUdpListenerFilter>(
-    _envoy_filter_config: &mut EC,
+    envoy_filter_config: &mut EC,
     name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
@@ -74,7 +77,8 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
         return None;
     }
     let cfg = load(config_bytes, validate_ppv2_auth)?;
-    Some(Box::new(udp::Ppv2AuthConfig { cfg }))
+    let counters = udp::Counters::register(envoy_filter_config);
+    Some(Box::new(udp::Ppv2AuthConfig { cfg, counters }))
 }
 
 /// The one place config failures become rejected listeners; Envoy says nothing, so stderr must.
