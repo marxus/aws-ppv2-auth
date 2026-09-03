@@ -18,17 +18,11 @@ const ULA: &str = r#""ula":"fd00:dead:beef::/48""#;
 const TENANT: &str = r#""allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128"]"#;
 
 fn ppv2_config(text: &str) -> tcp::Ppv2Config {
-    tcp::Ppv2Config {
-        cfg: Arc::new(config::parse(text).unwrap()),
-        enforce: false,
-    }
+    tcp::Ppv2Config::labelling(Arc::new(config::parse(text).unwrap()))
 }
 
 fn ppv2_auth_config(text: &str) -> tcp::Ppv2Config {
-    tcp::Ppv2Config {
-        cfg: Arc::new(config::parse(text).unwrap()),
-        enforce: true,
-    }
+    tcp::Ppv2Config::enforcing(Arc::new(config::parse(text).unwrap()))
 }
 
 fn auth_config(text: &str) -> tcp::AuthConfig {

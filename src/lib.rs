@@ -48,14 +48,11 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
     match name {
         "ppv2_auth" => {
             let cfg = load(config_bytes, validate_ppv2_auth)?;
-            Some(Box::new(tcp::Ppv2Config { cfg, enforce: true }))
+            Some(Box::new(tcp::Ppv2Config::enforcing(cfg)))
         }
         "ppv2" => {
             let cfg = load(config_bytes, validate_ppv2)?;
-            Some(Box::new(tcp::Ppv2Config {
-                cfg,
-                enforce: false,
-            }))
+            Some(Box::new(tcp::Ppv2Config::labelling(cfg)))
         }
         "auth" => {
             let cfg = load(config_bytes, validate_auth)?;

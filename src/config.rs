@@ -95,6 +95,14 @@ impl Config {
             .is_some_and(|set| set.contains(addr))
     }
 
+    /// The flat-list judgment for filters that run before any SNI exists.
+    /// Routed through `permits` so there is exactly one enforcement path -- if
+    /// scopes ever reach such a filter, the empty name matches nothing and this
+    /// denies rather than silently ignoring them.
+    pub fn permits_unscoped(&self, addr: u128) -> bool {
+        self.permits(b"", addr)
+    }
+
     /// The list this connection is judged against, or None if no scope claims it.
     ///
     /// Envoy's ServerNameMatcher order (domain_matcher.h:78-101): exact first, then

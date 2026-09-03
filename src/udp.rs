@@ -68,11 +68,7 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
             match ppv2::parse(buf) {
                 Ok(h) => {
                     let addr = identity::synthesize(prefix, &h);
-                    // Through `permits` rather than reaching into `allow`, so there
-                    // is one enforcement path. With no scopes it is the flat list;
-                    // if `sni` ever reaches UDP the empty name matches nothing and
-                    // this denies, instead of quietly ignoring the scopes.
-                    if self.cfg.permits(b"", identity::to_u128(addr)) {
+                    if self.cfg.permits_unscoped(identity::to_u128(addr)) {
                         self.payload.clear();
                         self.payload.extend_from_slice(&buf[h.len..]);
                         Decision::Forward

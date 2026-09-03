@@ -24,10 +24,25 @@ type Status = abi::envoy_dynamic_module_type_on_listener_filter_status;
 // --- ppv2 / ppv2_auth: parse, label, drain, maybe enforce --------------------
 
 pub struct Ppv2Config {
-    pub cfg: Arc<config::Config>,
+    cfg: Arc<config::Config>,
     /// Fixed by the filter_name at listener build -- `ppv2_auth` enforces, `ppv2`
     /// only labels. Never read from the config, so it cannot drift.
-    pub enforce: bool,
+    enforce: bool,
+}
+
+impl Ppv2Config {
+    /// `ppv2_auth`: label, then judge against the flat allowlist.
+    pub fn enforcing(cfg: Arc<config::Config>) -> Ppv2Config {
+        Ppv2Config { cfg, enforce: true }
+    }
+
+    /// `ppv2`: label and drain only; a later `auth` filter judges.
+    pub fn labelling(cfg: Arc<config::Config>) -> Ppv2Config {
+        Ppv2Config {
+            cfg,
+            enforce: false,
+        }
+    }
 }
 
 impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for Ppv2Config {
@@ -150,9 +165,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
                 // Strip the header before judging, so the access log shows the
                 // identity that was judged even when it is then refused.
                 envoy.drain_buffer(len);
-                // The same call udp.rs makes: with no scopes the empty name
-                // selects the flat list.
-                if self.enforce && !self.cfg.permits(b"", id) {
+                if self.enforce && !self.cfg.permits_unscoped(id) {
                     return self.refuse(envoy);
                 }
                 self.done = true;
