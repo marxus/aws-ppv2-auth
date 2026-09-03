@@ -1,6 +1,6 @@
 [package]
 name = "ppv2-auth"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Envoy dynamic module: AWS PROXY protocol v2 identity as a matchable IPv6 address"

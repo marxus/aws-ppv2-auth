@@ -132,12 +132,17 @@ struct Raw {
     ula: Option<String>,
     /// Tailscale's 4via6 /64. Without it there is no site space and everything uses `ula`.
     via: Option<String>,
-    /// site id -> the vpce-ids and source prefixes that resolve to it.
+    /// site id -> the vpce-ids and source prefixes that resolve to it, comma-separated.
+    ///
+    /// CSV rather than an array because the table is a ConfigMap, whose values are
+    /// strings, and CEL cannot build a map from a comprehension -- so kro passes
+    /// `.data` straight through and nothing has to reshape it. cidr::build already
+    /// speaks the same comma-separated form.
     ///
     /// BTreeMap, so iteration is ordered and a config that round-trips reads the
     /// same twice. JSON object keys are strings, so the id is parsed here.
     #[serde(default)]
-    sites: BTreeMap<String, Vec<String>>,
+    sites: BTreeMap<String, String>,
     #[serde(default)]
     allow: Vec<String>,
     scopes: Option<Vec<RawScope>>,
@@ -187,9 +192,9 @@ fn classify(member: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>, String> {
+fn build_sites(raw: BTreeMap<String, String>) -> Result<Vec<identity::Site>, String> {
     raw.into_iter()
-        .map(|(key, members)| {
+        .map(|(key, csv)| {
             // 0 is not reserved for anything, but tailscale renders it as the bare
             // prefix, which reads as "no site" -- so refuse it rather than emit it.
             let id: u16 = key
@@ -200,7 +205,8 @@ fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>
             }
             let mut vpce = Vec::new();
             let mut prefixes = Vec::new();
-            for m in &members {
+            // Empty entries dropped so a trailing comma is not a member named "".
+            for m in csv.split(',').map(str::trim).filter(|m| !m.is_empty()) {
                 match classify(m)? {
                     Some(cidr_text) => prefixes.push(cidr_text),
                     None => vpce.push(m.as_bytes().to_vec().into_boxed_slice()),

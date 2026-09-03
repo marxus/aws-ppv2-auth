@@ -157,9 +157,13 @@ they are rejected, because there they would read as applied and do nothing.
     ula: fd00:dead:beef::/48
     via: fd7a:115c:a1e0:b1a::/64        # tailscale's 4via6 range, a /64 not a /48
     sites:
-      "1": [vpce-028ff61de1d1fea8c, 3.126.239.93/32]
-      "2": [203.0.113.0/24, 198.51.100.7/32]
+      "1": vpce-028ff61de1d1fea8c,3.126.239.93/32
+      "2": 203.0.113.0/24,198.51.100.7/32
 ```
+
+Comma-separated, not an array, because the table is a ConfigMap — whose values
+are strings — and CEL cannot build a map from a comprehension, so the generator
+passes `.data` through untouched.
 
 A site member is a `vpce-id` or a source prefix, told apart by trying to read it
 as an address. IPv4 is lifted to `::ffff:a.b.c.d/(96+N)` so one matcher covers
