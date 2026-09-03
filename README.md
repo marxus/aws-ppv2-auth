@@ -4,13 +4,15 @@ An Envoy dynamic module that turns AWS PROXY protocol v2 identity into an
 **IPv6 address**, so ordinary `clientCIDRs` rules can express PrivateLink tenant
 identity at both L4 and L7.
 
-Two filters ship in one `.so`, chosen by `filter_name`:
+Three filters ship in one `.so`, chosen by `filter_name`. Each name is a position
+in a chain and takes exactly one config shape:
 
-    ppv2   parse the PROXY header, synthesize, label the socket, drain
-    auth   establish identity, scope it by SNI, allow or close
+    ppv2_auth   parse the header, synthesize, enforce      ula + allow
+    ppv2        parse the header, synthesize, label only   ula
+    auth        read that label, scope by SNI, enforce     scopes
 
-    tcp  -> [auth, ...]
-    udp  -> [auth, ...]
+    tcp  -> [ppv2_auth, ...]
+    udp  -> [ppv2_auth, ...]
     tls  -> [ppv2, tls_inspector, auth, ...]
 
 TLS is the special case. `auth` needs the SNI, which exists only after
@@ -78,7 +80,7 @@ ConfigMap:
 pod:
   volumes:
     - name: aws-ppv2-identity
-      image: { reference: ghcr.io/marxus/aws-ppv2-identity:0.4.0 }
+      image: { reference: ghcr.io/marxus/aws-ppv2-identity:0.5.0 }
 container:
   volumeMounts: [{ name: aws-ppv2-identity, mountPath: /modules, readOnly: true }]
   env: [{ name: LD_LIBRARY_PATH, value: /modules }]
@@ -112,15 +114,17 @@ Each filter takes one config shape, and anything else fails the listener:
 
 | filter | config | meaning |
 |---|---|---|
+| `ppv2_auth` | `ula` + `allow` | the whole job in one — plain TCP, and UDP |
 | `ppv2` | `ula` only | synthesize and label; it never denies, so it takes no rules |
-| `auth` | `ula` + `allow` | parse the header here — plain TCP, and UDP |
 | `auth` | `scopes` | read the label a `ppv2` filter left — the TLS chain |
 
-**`ula` and `scopes` are mutually exclusive, and the reason is positional rather
-than about transport**: `ula` means this filter runs *before* `tls_inspector`, so
-no SNI exists yet; `scopes` means it runs *after*, so the socket is already
-labelled. Both at once is the contradiction "first and not first". That is why
-`auth` never needs to know whether it is on TCP or UDP.
+The split exists only because TLS forces it: `auth` needs the SNI, which exists
+only after `tls_inspector`, and `tls_inspector` cannot find a ClientHello until
+the PROXY header is drained. Everywhere else `ppv2_auth` does both halves.
+
+Because the name fixes the shape, a filter in the wrong place fails its listener
+rather than half-working — `ppv2_auth` with `scopes` is rejected (it runs before
+`tls_inspector`, so there is no SNI), and `auth` with a `ula` is too.
 
 An `auth` filter with no `allow` at all is valid and denies everything — an empty
 allowlist is deny-all, the same as an empty security group. `require_ppv2: false`

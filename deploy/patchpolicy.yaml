@@ -10,9 +10,14 @@
 #
 # The chain shapes, and why they differ:
 #
-#   tcp  -> [auth, ...]
-#   udp  -> [auth, ...]
+#   tcp  -> [ppv2_auth, ...]
+#   udp  -> [ppv2_auth, ...]
 #   tls  -> [ppv2, tls_inspector, auth, ...]
+#
+# The filter_name is the position: `ppv2_auth` is the whole job in one filter,
+# `ppv2` labels only, `auth` reads that label and scopes it. Each takes exactly
+# one config shape, so a misplaced filter fails its listener rather than
+# half-working.
 #
 # TLS is the special case. `auth` needs the SNI, which only exists after
 # tls_inspector has run, and tls_inspector cannot find a ClientHello until the
@@ -105,22 +110,22 @@ spec:
                 # `ppv2` never enforces, so it takes `ula` and nothing else.
                 ula: fd00:dead:beef::/48
 
-    # --- UDP listener: [auth] ------------------------------------------------
+    # --- UDP listener: [ppv2_auth] ------------------------------------------------
     #
     # No way to hand an identity between UDP filters -- the ABI has no filter
-    # state and no set_remote_address -- so `auth` does the whole job, with `ula`.
-    # Same config rules as TCP; the filter never asks which transport it is on.
+    # state and no set_remote_address -- so it is `ppv2_auth`, the whole job in
+    # one. Same shape a plain TCP listener uses; the name says so.
     - type: type.googleapis.com/envoy.config.listener.v3.Listener
       name: envoy-gateway-system/gw/dns
       operation:
         op: add
         path: /listener_filters/0
         value:
-          name: aws-ppv2-identity-auth
+          name: aws-ppv2-identity-ppv2-auth
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.udp.dynamic_modules.v3.DynamicModuleUdpListenerFilter
             dynamic_module_config: { name: aws-ppv2-identity }
-            filter_name: auth
+            filter_name: ppv2_auth
             filter_config:
               "@type": type.googleapis.com/google.protobuf.Struct
               value:

@@ -1,17 +1,19 @@
 //! Envoy dynamic module: PROXY protocol v2 identity, for TCP and UDP.
 //!
-//! One shared object, two filters, chosen by `filter_name`:
+//! One shared object, three filters, chosen by `filter_name`. Each name is a
+//! position in a chain, and takes exactly one config shape:
 //!
-//!   ppv2   parse the PROXY header, synthesize, label the socket, drain
-//!   auth   establish identity, scope it by SNI, allow or close
+//!   ppv2_auth   parse the header, synthesize, enforce a flat allowlist   `ula` + `allow`
+//!   ppv2        parse the header, synthesize, label and drain only       `ula`
+//!   auth        read the label, scope by SNI, enforce                    `scopes`
 //!
-//!   tcp  -> [auth, ...]
-//!   udp  -> [auth, ...]
+//!   tcp  -> [ppv2_auth, ...]
+//!   udp  -> [ppv2_auth, ...]
 //!   tls  -> [ppv2, tls_inspector, auth, ...]
 //!
-//! Deny by default at every one of them. TLS is the only case that needs both:
-//! `auth` reads the SNI, which exists only after tls_inspector, and tls_inspector
-//! cannot see a ClientHello until the header is drained.
+//! Deny by default in every one that enforces. TLS is the only case needing the
+//! split: `auth` reads the SNI, which exists only after tls_inspector, and
+//! tls_inspector cannot see a ClientHello until the header is drained.
 
 use envoy_proxy_dynamic_modules_rust_sdk::*;
 use std::sync::Arc;
@@ -44,6 +46,10 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
     config_bytes: &[u8],
 ) -> Option<Box<dyn ListenerFilterConfig<ELF>>> {
     match name {
+        "ppv2_auth" => {
+            let cfg = load(config_bytes, validate_ppv2_auth)?;
+            Some(Box::new(tcp::AuthConfig { cfg }))
+        }
         "ppv2" => {
             let cfg = load(config_bytes, validate_ppv2)?;
             Some(Box::new(tcp::Ppv2Config { cfg }))
@@ -53,7 +59,9 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
             Some(Box::new(tcp::AuthConfig { cfg }))
         }
         _ => {
-            eprintln!("aws-ppv2-identity: unknown filter_name {name:?}; expected ppv2 or auth");
+            eprintln!(
+                "aws-ppv2-identity: unknown filter_name {name:?}; expected ppv2_auth, ppv2 or auth"
+            );
             None
         }
     }
@@ -64,14 +72,14 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
     name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
-    if name != "auth" {
-        // A UDP `ppv2` filter could not hand its identity anywhere: the UDP ABI has
-        // no filter state and no set_remote_address, so UDP is `auth` alone. The
-        // config rules are otherwise identical -- see validate_auth.
-        eprintln!("aws-ppv2-identity: UDP supports only filter_name auth, got {name:?}");
+    if name != "ppv2_auth" {
+        // UDP is always the whole job in one filter: the ABI has no filter state
+        // and no set_remote_address, so nothing can hand an identity onward, and
+        // there is no handshake for `auth` to scope by.
+        eprintln!("aws-ppv2-identity: UDP supports only filter_name ppv2_auth, got {name:?}");
         return None;
     }
-    let cfg = load(config_bytes, validate_auth)?;
+    let cfg = load(config_bytes, validate_ppv2_auth)?;
     Some(Box::new(udp::AuthConfig { cfg }))
 }
 
@@ -100,36 +108,44 @@ fn parse(bytes: &[u8]) -> Result<config::Config, String> {
     config::parse(text)
 }
 
-/// `ppv2` labels and drains, nothing else. It needs `ula` to synthesize, and an
-/// allowlist here would be a rule that reads as applied and does nothing.
+/// `ppv2` labels and drains, nothing else -- it never denies, so a rule here would
+/// read as applied and do nothing.
 pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
     if cfg.prefix.is_none() {
         return Err("`ppv2` needs `ula` to synthesize an identity");
     }
     if !cfg.allow.is_empty() || cfg.scopes.is_some() {
-        return Err("`ppv2` takes only `ula`; put `allow` and `scopes` on the `auth` filter");
+        return Err("`ppv2` takes only `ula`; use `ppv2_auth` to also enforce");
     }
     Ok(())
 }
 
-/// `auth` needs exactly one way to learn the identity.
+/// `ppv2_auth` is the whole job in one filter: plain TCP, and UDP.
 ///
-/// The two are positional, not about transport -- which is why this is the same
-/// check for TCP and UDP, and why `auth` never has to know which it is:
-///
-///   `ula`    -- I run BEFORE tls_inspector, so I parse the header myself.
-///   `scopes` -- I run AFTER it, so a preceding `ppv2` filter already labelled the
-///               socket and the SNI exists to scope by.
-///
-/// Both at once is the contradiction "first and not first".
-pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    // No `allow` is not an error: an empty allowlist denies everything, exactly as
-    // an empty security group does. Rejecting it would make "is the list non-empty"
-    // load-bearing -- the thing config.rs refuses to do for the same reason -- and
-    // would take the listener down when you comment out the last rule to debug.
-    match (cfg.prefix.is_some(), cfg.scopes.is_some()) {
-        (true, false) | (false, true) => Ok(()),
-        (true, true) => Err("`ula` and `scopes` are mutually exclusive: `ula` means this filter runs before tls_inspector, so there is no SNI yet"),
-        (false, false) => Err("`auth` needs `ula` (parse the header here) or `scopes` (read the label a `ppv2` filter left)"),
+/// It runs before anything else, so there is no SNI to scope by -- an empty
+/// `allow` is fine and denies everything, the way an empty security group does.
+pub fn validate_ppv2_auth(cfg: &config::Config) -> Result<(), &'static str> {
+    if cfg.prefix.is_none() {
+        return Err("`ppv2_auth` needs `ula` to synthesize an identity");
     }
+    if cfg.scopes.is_some() {
+        return Err("`ppv2_auth` runs before tls_inspector, so there is no SNI yet; use `auth`");
+    }
+    Ok(())
+}
+
+/// `auth` reads the label a preceding `ppv2` filter left, and scopes it by SNI.
+pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
+    if cfg.prefix.is_some() {
+        return Err("`auth` reads the label `ppv2` left, so it takes no `ula`; use `ppv2_auth`");
+    }
+    if cfg.scopes.is_none() {
+        return Err("`auth` needs `scopes`");
+    }
+    // A top-level `allow` is never consulted once scopes exist, so it would be a
+    // rule that reads as applied and does nothing.
+    if !cfg.allow.is_empty() {
+        return Err("`auth` ignores a top-level `allow`; put those rules in a scope");
+    }
+    Ok(())
 }

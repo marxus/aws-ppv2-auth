@@ -1,7 +1,7 @@
 //! filter_config parsing, and the fail-closed choices that depend on it.
 
 use aws_ppv2_identity::config::Pattern;
-use aws_ppv2_identity::{config, identity, validate_auth, validate_ppv2};
+use aws_ppv2_identity::{config, identity, validate_auth, validate_ppv2, validate_ppv2_auth};
 
 fn ip(s: &str) -> u128 {
     identity::to_u128(s.parse::<std::net::Ipv6Addr>().unwrap().octets())
@@ -82,54 +82,38 @@ fn require_ppv2_false_cannot_be_combined_with_an_allowlist() {
 // --- which filter takes which shape ----------------------------------------
 
 #[test]
-fn ula_and_scopes_are_the_two_ways_auth_can_learn_an_identity() {
-    // `ula`: parse the header here. The plain TCP and UDP shape.
-    let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1::/64"]}"#)
-        .unwrap();
-    assert!(validate_auth(&c).is_ok());
+fn each_filter_name_takes_exactly_one_config_shape() {
+    let ula = r#"{"ula":"fd00:dead:beef::/48"}"#;
+    let ula_allow = r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1::/64"]}"#;
+    let scopes = r#"{"scopes":[{"sni":["a.test"],"allow":["fd00:dead:beef:1::/64"]}]}"#;
+    let both = r#"{"ula":"fd00:dead:beef::/48","scopes":[{"sni":["a.test"]}]}"#;
 
-    // `scopes`: read the label a preceding `ppv2` filter left. The TLS shape.
-    let c = config::parse(r#"{"scopes":[{"sni":["a.test"],"allow":["fd00:dead:beef:1::/64"]}]}"#)
-        .unwrap();
-    assert!(c.prefix.is_none());
-    assert!(validate_auth(&c).is_ok());
-    assert!(validate_ppv2(&c).is_err());
+    // ppv2: label and drain only.
+    assert!(validate_ppv2(&config::parse(ula).unwrap()).is_ok());
+    assert!(validate_ppv2(&config::parse(ula_allow).unwrap()).is_err());
+    assert!(validate_ppv2(&config::parse(scopes).unwrap()).is_err());
 
-    // Both is the contradiction "I run before tls_inspector and also after it".
+    // ppv2_auth: parse the header AND enforce. Plain TCP and UDP.
+    assert!(validate_ppv2_auth(&config::parse(ula_allow).unwrap()).is_ok());
+    assert!(validate_ppv2_auth(&config::parse(ula).unwrap()).is_ok()); // deny-all
+    assert!(validate_ppv2_auth(&config::parse(scopes).unwrap()).is_err());
+    assert!(validate_ppv2_auth(&config::parse(both).unwrap()).is_err());
+
+    // auth: read the label, scope by SNI. The TLS chain.
+    assert!(validate_auth(&config::parse(scopes).unwrap()).is_ok());
+    assert!(validate_auth(&config::parse(ula_allow).unwrap()).is_err());
+    assert!(validate_auth(&config::parse(both).unwrap()).is_err());
+}
+
+#[test]
+fn auth_rejects_a_top_level_allow_it_would_never_consult() {
+    // Once `scopes` exists the flat list is never reached, so leaving it there
+    // would be a rule that reads as applied and does nothing.
     let c = config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","scopes":[{"sni":["a.test"],"allow":["fd00:dead:beef:1::/64"]}]}"#
+        r#"{"allow":["fd00:dead:beef:1::/64"],"scopes":[{"sni":["a.test"],"allow":["fd00:dead:beef:1::/64"]}]}"#,
     )
     .unwrap();
     assert!(validate_auth(&c).is_err());
-
-    // Neither leaves nothing to derive identity from.
-    let c = config::parse(r#"{"allow":["fd00:dead:beef:1::/64"]}"#).unwrap();
-    assert!(validate_auth(&c).is_err());
-}
-
-#[test]
-fn ppv2_takes_only_ula() {
-    let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1::/64"]}"#)
-        .unwrap();
-    assert!(validate_ppv2(&c).is_err());
-
-    let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","scopes":[]}"#).unwrap();
-    assert!(validate_ppv2(&c).is_err());
-
-    let c = config::parse(r#"{"ula":"fd00:dead:beef::/48"}"#).unwrap();
-    assert!(validate_ppv2(&c).is_ok());
-}
-
-#[test]
-fn auth_has_one_rule_set_whatever_the_transport() {
-    // The filter never has to know TCP from UDP: what matters is position in the
-    // chain, not transport. Both hooks call validate_auth.
-    let ula = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1::/64"]}"#)
-        .unwrap();
-    let sni = config::parse(r#"{"scopes":[{"sni":["a.test"],"allow":["fd00:dead:beef:1::/64"]}]}"#)
-        .unwrap();
-    assert!(validate_auth(&ula).is_ok());
-    assert!(validate_auth(&sni).is_ok());
 }
 
 #[test]
@@ -138,7 +122,7 @@ fn an_auth_filter_with_no_allow_is_valid_and_denies_everything() {
     // than a mistake. Rejecting it would make "is the list non-empty" load-bearing.
     let t = ip(TENANT);
     let c = config::parse(r#"{"ula":"fd00:dead:beef::/48"}"#).unwrap();
-    assert!(validate_auth(&c).is_ok());
+    assert!(validate_ppv2_auth(&c).is_ok());
     assert!(!c.permits(b"", t));
 }
 
