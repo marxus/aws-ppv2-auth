@@ -18,7 +18,7 @@
 //! ServerNameMatcher uses, where one `domains` list maps to one action.
 //!
 //! `allow` entries (flat or scoped) may be `@group` references into `groups`, a
-//! list of named source bags that may themselves nest via `@refs` -- see graph.rs
+//! map of named source bags that may themselves nest via `@refs` -- see graph.rs
 //! for the walk rules and identity::encode_member for how each source becomes a
 //! CIDR. Expansion happens at parse; the running filter holds plain cidr::Sets
 //! and the packet path is unchanged.
@@ -36,6 +36,7 @@
 
 use crate::{cidr, graph, identity};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug)]
@@ -148,22 +149,15 @@ struct Raw {
     #[serde(default)]
     allow: Vec<String>,
     scopes: Option<Vec<RawScope>>,
-    /// Named source bags for `@refs` in `allow` and `scopes[].allow`. A member is
-    /// any source (encode_member's grammar) or `@other-group`; expansion happens
-    /// here at parse, so the running filter still holds plain cidr::Sets. May sit
-    /// unreferenced -- that is the appendable base state, same as an empty
-    /// `scopes`. A LIST OF OBJECTS like `sites`, and for the same reason: CEL can
-    /// build a list from a comprehension but not a map.
+    /// Named source bags for `@refs` in `allow` and `scopes[].allow`, keyed by
+    /// group name. A member is any source (encode_member's grammar) or
+    /// `@other-group`; expansion happens here at parse, so the running filter
+    /// still holds plain cidr::Sets. May sit unreferenced -- that is the
+    /// appendable base state, same as an empty `scopes`. A map rather than a list
+    /// like `sites`: CEL's transformMapEntry folds a CR collection into exactly
+    /// this shape, dynamic keys included.
     #[serde(default)]
-    groups: Vec<RawGroup>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawGroup {
-    name: String,
-    #[serde(default)]
-    members: Vec<String>,
+    groups: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -296,15 +290,14 @@ pub fn parse(text: &str) -> Result<Config, String> {
     };
     // Literals are encoded NOW, referenced or not -- otherwise a bad member hides
     // in an unreferenced group until some later tenant append references it, and
-    // fails THAT config. The graph itself accepts any shape; see graph.rs, and a
-    // name appearing twice is last-wins, upsert semantics.
+    // fails THAT config. The graph itself accepts any shape; see graph.rs.
     let mut groups = graph::Graph::default();
-    for g in raw.groups {
-        for m in g.members.iter().filter(|m| !m.starts_with('@')) {
+    for (name, members) in raw.groups {
+        for m in members.iter().filter(|m| !m.starts_with('@')) {
             identity::encode_member(prefix.as_ref(), m)
-                .map_err(|e| format!("group {:?}: {e}", g.name))?;
+                .map_err(|e| format!("group {name:?}: {e}"))?;
         }
-        groups.upsert(g.name, g.members);
+        groups.upsert(name, members);
     }
 
     let allow = build(&raw.allow, &groups, prefix.as_ref())?;

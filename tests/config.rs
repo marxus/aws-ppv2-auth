@@ -392,7 +392,7 @@ fn one_id_cannot_appear_twice() {
 fn an_allow_entry_may_reference_a_group() {
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
-            "groups":[{"name":"tenant-a","members":["fd00:dead:beef:1::/64"]}],
+            "groups":{"tenant-a":["fd00:dead:beef:1::/64"]},
             "allow":["@tenant-a","fd00:dead:beef:9::/64"]}"#,
     )
     .unwrap();
@@ -407,11 +407,11 @@ fn groups_nest_and_a_diamond_resolves_once() {
     // cidr::build, so the set has one range however many paths reached it.
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
-            "groups":[
-              {"name":"leaf","members":["fd00:dead:beef:1::/64"]},
-              {"name":"a","members":["@leaf"]},
-              {"name":"b","members":["@leaf"]},
-              {"name":"top","members":["@a","@b"]}],
+            "groups":{
+              "leaf":["fd00:dead:beef:1::/64"],
+              "a":["@leaf"],
+              "b":["@leaf"],
+              "top":["@a","@b"]},
             "allow":["@top"]}"#,
     )
     .unwrap();
@@ -438,7 +438,7 @@ fn a_cycle_terminates_and_yields_what_it_passed() {
     // literals seen along the way still land.
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
-            "groups":[{"name":"a","members":["@b","fd00:dead:beef:1::/64"]},{"name":"b","members":["@a","fd00:dead:beef:9::/64"]}],
+            "groups":{"a":["@b","fd00:dead:beef:1::/64"],"b":["@a","fd00:dead:beef:9::/64"]},
             "allow":["@a"]}"#,
     )
     .unwrap();
@@ -446,7 +446,7 @@ fn a_cycle_terminates_and_yields_what_it_passed() {
     assert!(c.permits_unscoped(ip(OTHER)));
     // Self-reference is the one-node cycle.
     let c = config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","groups":[{"name":"a","members":["@a","fd00:dead:beef:1::/64"]}],"allow":["@a"]}"#,
+        r#"{"ula":"fd00:dead:beef::/48","groups":{"a":["@a","fd00:dead:beef:1::/64"]},"allow":["@a"]}"#,
     )
     .unwrap();
     assert!(c.permits_unscoped(ip(TENANT)));
@@ -455,7 +455,7 @@ fn a_cycle_terminates_and_yields_what_it_passed() {
 #[test]
 fn scoped_allow_lists_take_refs_too() {
     let c = config::parse(
-        r#"{"groups":[{"name":"tenant-a","members":["fd00:dead:beef:1::/64"]}],
+        r#"{"groups":{"tenant-a":["fd00:dead:beef:1::/64"]},
             "scopes":[{"sni":["l7.mgmt.test"],"allow":["@tenant-a"]}]}"#,
     )
     .unwrap();
@@ -469,7 +469,7 @@ fn unreferenced_groups_are_the_appendable_base_state() {
     // Same story as `scopes: []`: the base config ships the groups, tenant CRs
     // append entries that reference them. Until then: deny-all, valid.
     let c = config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","groups":[{"name":"tenant-a","members":["fd00:dead:beef:1::/64"]}]}"#,
+        r#"{"ula":"fd00:dead:beef::/48","groups":{"tenant-a":["fd00:dead:beef:1::/64"]}}"#,
     )
     .unwrap();
     assert!(validate_ppv2_auth(&c).is_ok());
@@ -482,7 +482,7 @@ fn members_encode_like_the_wire_does() {
     // header carrying it: labels hash to kind-1, v4 lifts to kind-4, v6 passes.
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
-            "groups":[{"name":"tenant-a","members":["vpce-abc","10.1.0.0/16","203.0.113.7","fd00:dead:beef:9::/64","2001:db8::1"]}],
+            "groups":{"tenant-a":["vpce-abc","10.1.0.0/16","203.0.113.7","fd00:dead:beef:9::/64","2001:db8::1"]},
             "allow":["@tenant-a"]}"#,
     )
     .unwrap();
@@ -527,7 +527,7 @@ fn an_auth_scope_may_carry_labels_when_the_config_has_a_ula() {
     // The TLS chain's whole point: tenant scopes naming raw sources.
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
-            "groups":[{"name":"tenant-a","members":["vpce-abc"]}],
+            "groups":{"tenant-a":["vpce-abc"]},
             "scopes":[{"sni":["l7.mgmt.test"],"allow":["@tenant-a","10.1.0.0/16"]}]}"#,
     )
     .unwrap();
@@ -540,9 +540,9 @@ fn a_member_needing_encoding_fails_at_parse_even_in_an_unreferenced_group() {
     // The one refusal left is a label or v4 with no `ula` to encode into, and it
     // is checked eagerly -- otherwise it hides until some later tenant append
     // references the group, and breaks that config instead of this one.
-    assert!(config::parse(r#"{"groups":[{"name":"stale","members":["vpce-abc"]}],"scopes":[]}"#).is_err());
+    assert!(config::parse(r#"{"groups":{"stale":["vpce-abc"]},"scopes":[]}"#).is_err());
     assert!(config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","groups":[{"name":"stale","members":["vpce-abc"]}]}"#
+        r#"{"ula":"fd00:dead:beef::/48","groups":{"stale":["vpce-abc"]}}"#
     )
     .is_ok());
 }
