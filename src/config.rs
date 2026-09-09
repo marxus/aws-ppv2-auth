@@ -36,19 +36,57 @@
 
 use crate::{cidr, graph, identity};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 #[derive(Debug)]
 pub struct Config {
-    /// Present iff the config carries `ula`. The header-parsing filters need it to
-    /// synthesize; `auth` may carry one purely so its members can encode, and its
-    /// filter path never reads this.
-    pub scheme: Option<identity::Scheme>,
+    /// The identity table -- ula, sites, groups -- INTERNED per process: every
+    /// filter on this pod whose table content is identical shares one Arc, one
+    /// parse, one set of match indices. allow/scopes below are the listener's
+    /// own concern and stay per-filter.
+    pub table: Arc<Table>,
     /// Used when `scopes` is absent.
     pub allow: cidr::Set,
     /// None = flat-list mode. Some([]) = SNI mode, nothing claimed, deny all -- the appendable base state.
     pub scopes: Option<Vec<Scope>>,
+}
+
+/// What every listener shares: how a header encodes (scheme) and what names mean
+/// (groups). Content-addressed -- see `intern`.
+#[derive(Debug)]
+pub struct Table {
+    /// Present iff the config carries `ula`. The header-parsing filters need it to
+    /// synthesize; `auth` may carry one purely so its members can encode, and its
+    /// filter path never reads this.
+    pub scheme: Option<identity::Scheme>,
+    pub groups: graph::Graph,
+}
+
+impl Config {
+    pub fn scheme(&self) -> Option<&identity::Scheme> {
+        self.table.scheme.as_ref()
+    }
+}
+
+/// The per-process table registry. Weak so a table lives exactly as long as some
+/// listener's config holds it; dead entries are pruned on insert. Keyed by the
+/// canonical JSON of (ula, sites, groups) -- BTreeMaps serialize sorted, so equal
+/// content is equal text.
+static TABLES: OnceLock<Mutex<HashMap<String, Weak<Table>>>> = OnceLock::new();
+
+fn intern(key: String, build: impl FnOnce() -> Result<Table, String>) -> Result<Arc<Table>, String> {
+    let mut reg = TABLES.get_or_init(Default::default).lock().unwrap();
+    if let Some(t) = reg.get(&key).and_then(Weak::upgrade) {
+        return Ok(t);
+    }
+    // Built under the lock: config load is rare, and this stops two listeners
+    // racing to build the same table twice.
+    let t = Arc::new(build()?);
+    reg.retain(|_, w| w.strong_count() > 0);
+    reg.insert(key, Arc::downgrade(&t));
+    Ok(t)
 }
 
 /// Several hostnames sharing one allowlist.
@@ -172,11 +210,8 @@ struct RawScope {
 /// label -- see graph.rs); every literal that comes out is then encoded the way
 /// the packet path encodes a header carrying it (identity::encode_member), so an
 /// allow entry and the wire meet on the same address by construction.
-fn build(
-    list: &[String],
-    groups: &graph::Graph,
-    scheme: Option<&identity::Scheme>,
-) -> Result<cidr::Set, String> {
+fn build(list: &[String], table: &Table) -> Result<cidr::Set, String> {
+    let (groups, scheme) = (&table.groups, table.scheme.as_ref());
     let mut encoded: Vec<String> = Vec::new();
     for m in groups.resolve(list) {
         // The one member that expands to MANY entries, so it lives here in the
@@ -262,35 +297,43 @@ fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: Raw = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
-    // The prefix serves two masters: packet-time synthesis (scheme) and
-    // config-time member encoding (build). `auth` may carry a `ula` for the
-    // second alone -- its filter path never reads scheme.
-    let prefix = match &raw.ula {
-        Some(u) => Some(identity::parse_prefix(u).map_err(str::to_string)?),
-        None => None,
-    };
-    let scheme = match prefix {
-        Some(p) => Some(identity::Scheme::new(p, build_sites(raw.sites)?)),
-        None => {
-            if !raw.sites.is_empty() {
-                return Err("`sites` needs `ula`; it describes how a header is encoded".to_string());
+    // The table's identity is its content; allow/scopes are excluded on purpose.
+    let key = serde_json::to_string(&(&raw.ula, &raw.sites, &raw.groups))
+        .map_err(|e| e.to_string())?;
+    let (ula, raw_sites, raw_groups) = (raw.ula, raw.sites, raw.groups);
+    let table = intern(key, move || {
+        // The prefix serves two masters: packet-time synthesis (scheme) and
+        // config-time member encoding (build). `auth` may carry a `ula` for the
+        // second alone -- its filter path never reads scheme.
+        let scheme = match &ula {
+            Some(u) => {
+                let p = identity::parse_prefix(u).map_err(str::to_string)?;
+                Some(identity::Scheme::new(p, build_sites(raw_sites)?))
             }
-            None
+            None => {
+                if !raw_sites.is_empty() {
+                    return Err(
+                        "`sites` needs `ula`; it describes how a header is encoded".to_string()
+                    );
+                }
+                None
+            }
+        };
+        // Literals are encoded NOW, referenced or not -- otherwise a bad member
+        // hides in an unreferenced group until some later tenant append references
+        // it, and fails THAT config. The graph accepts any shape; see graph.rs.
+        let mut groups = graph::Graph::default();
+        for (name, members) in raw_groups {
+            for m in members.iter().filter(|m| !m.starts_with('@')) {
+                identity::encode_member(scheme.as_ref(), m)
+                    .map_err(|e| format!("group {name:?}: {e}"))?;
+            }
+            groups.upsert(name, members);
         }
-    };
-    // Literals are encoded NOW, referenced or not -- otherwise a bad member hides
-    // in an unreferenced group until some later tenant append references it, and
-    // fails THAT config. The graph itself accepts any shape; see graph.rs.
-    let mut groups = graph::Graph::default();
-    for (name, members) in raw.groups {
-        for m in members.iter().filter(|m| !m.starts_with('@')) {
-            identity::encode_member(scheme.as_ref(), m)
-                .map_err(|e| format!("group {name:?}: {e}"))?;
-        }
-        groups.upsert(name, members);
-    }
+        Ok(Table { scheme, groups })
+    })?;
 
-    let allow = build(&raw.allow, &groups, scheme.as_ref())?;
+    let allow = build(&raw.allow, &table)?;
     let scopes = match raw.scopes {
         None => None,
         Some(list) => Some(
@@ -298,7 +341,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 .map(|s| {
                     Ok(Scope {
                         names: s.sni.iter().map(|n| Pattern::parse(n)).collect(),
-                        allow: build(&s.allow, &groups, scheme.as_ref())?,
+                        allow: build(&s.allow, &table)?,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -306,7 +349,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     };
 
     Ok(Config {
-        scheme,
+        table,
         allow,
         scopes,
     })

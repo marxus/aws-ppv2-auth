@@ -15,7 +15,7 @@ const OTHER: &str = "fd00:dead:beef:9::1";
 #[test]
 fn ula_mode_takes_a_flat_allow_list() {
     let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["fd00:dead:beef:1:7b53:e75b:6e3d:cfdb/128","fd00:dead:beef:4::12c7:0/112"]}"#).unwrap();
-    let scheme = c.scheme.as_ref().unwrap();
+    let scheme = c.scheme().unwrap();
     assert_eq!(scheme.prefix, [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef]);
     // Nothing onboarded, so every header falls to kind 1 or 4.
     assert!(scheme.sites.is_empty());
@@ -303,7 +303,7 @@ fn sites_take_endpoint_ids_and_prefixes_of_either_family() {
                       "3":["vpce-0aaa","vpce-0bbb"]}}"#,
     )
     .unwrap();
-    let s = c.scheme.as_ref().unwrap();
+    let s = c.scheme().unwrap();
     assert_eq!(s.sites.len(), 3);
 
     // Order is the generator's, not ours -- kro sorts the keys before emitting.
@@ -330,7 +330,7 @@ fn a_bare_site_address_is_a_single_host() {
              "sites":{"5":["198.51.100.7"]}}"#,
     )
     .unwrap();
-    let s = &c.scheme.as_ref().unwrap().sites[0];
+    let s = &c.scheme().unwrap().sites[0];
     assert!(s.cidrs.contains(ip("::ffff:198.51.100.7")));
     assert!(!s.cidrs.contains(ip("::ffff:198.51.100.8")));
 }
@@ -393,7 +393,7 @@ fn a_map_cannot_say_one_id_twice() {
     .unwrap();
     // "01" parses to the same id -- both survive as table entries with id 1, and
     // lowest-id-wins ordering keeps lookups deterministic anyway.
-    assert_eq!(c.scheme.as_ref().unwrap().sites.len(), 2);
+    assert_eq!(c.scheme().unwrap().sites.len(), 2);
 }
 
 // --- groups and @refs --------------------------------------------------------
@@ -657,4 +657,26 @@ fn a_site_star_expands_to_every_declared_site() {
     assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a::")));
     let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["!*"]}"#).unwrap();
     assert!(c.allow.is_empty());
+}
+
+// --- table interning -----------------------------------------------------------
+
+#[test]
+fn identical_tables_are_shared_and_listener_rules_are_not() {
+    // Two listeners, same ula/sites/groups, different allow: ONE table (pointer-
+    // equal Arc -- one parse, one set of indices per pod), two rule sets.
+    let base = r#""ula":"fd00:dead:beef::/48",
+        "sites":{"1":["vpce-a"]},
+        "groups":{"tenant-a":["!1"]}"#;
+    let a = config::parse(&format!(r#"{{{base},"allow":["@tenant-a"]}}"#)).unwrap();
+    let b = config::parse(&format!(r#"{{{base},"allow":["10.0.0.0/8"]}}"#)).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&a.table, &b.table));
+    assert!(a.permits_unscoped(ip("fd00:dead:beef:b1a:0:1::")));
+    assert!(!b.permits_unscoped(ip("fd00:dead:beef:b1a:0:1::")));
+
+    // Different table content -> different table.
+    let c = config::parse(&format!(r#"{{{base},"scopes":[]}}"#)).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&a.table, &c.table)); // same base, scopes are listener concern
+    let d = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":[]}"#).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&a.table, &d.table));
 }

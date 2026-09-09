@@ -203,7 +203,7 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
             return Status::Continue;
         }
         // Unreachable: lib.rs rejects a config without `ula`.
-        let Some(scheme) = &self.cfg.scheme else {
+        let Some(scheme) = self.cfg.scheme() else {
             return self.refuse(envoy, "missing_ula");
         };
 
