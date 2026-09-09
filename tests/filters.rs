@@ -13,11 +13,20 @@ use std::sync::Arc;
 use abi::envoy_dynamic_module_type_on_listener_filter_status as TcpStatus;
 use abi::envoy_dynamic_module_type_on_udp_listener_filter_status as UdpStatus;
 
-const ULA: &str = r#""ula":"fd00:dead:beef::/48""#;
 /// sha256("vpce-0123456789abcdef0")[..4] plus the client 10.0.1.28 -- see tests/identity.rs.
-const TENANT: &str = r#""allow":["fd00:dead:beef:1:7b53:e75b:a00:11c/128"]"#;
+const TENANT: &str = r#"{"allow":["fd00:dead:beef:1:7b53:e75b:a00:11c/128"]}"#;
+
+/// Publish the test table ONCE per process -- enforcing filters carry rules only
+/// and judge against whatever is published, so every test here shares this.
+fn setup() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        config::publish(config::parse_table(r#"{"ula":"fd00:dead:beef::/48"}"#).unwrap());
+    });
+}
 
 fn ppv2_config(text: &str) -> tcp::Ppv2Config {
+    setup();
     tcp::Ppv2Config::labelling(
         Arc::new(config::parse(text).unwrap()),
         tcp::Counters::default(),
@@ -25,6 +34,7 @@ fn ppv2_config(text: &str) -> tcp::Ppv2Config {
 }
 
 fn ppv2_auth_config(text: &str) -> tcp::Ppv2Config {
+    setup();
     tcp::Ppv2Config::enforcing(
         Arc::new(config::parse(text).unwrap()),
         tcp::Counters::default(),
@@ -32,6 +42,7 @@ fn ppv2_auth_config(text: &str) -> tcp::Ppv2Config {
 }
 
 fn auth_config(text: &str) -> tcp::AuthConfig {
+    setup();
     tcp::AuthConfig {
         cfg: Arc::new(config::parse(text).unwrap()),
         counters: tcp::Counters::default(),
@@ -39,6 +50,7 @@ fn auth_config(text: &str) -> tcp::AuthConfig {
 }
 
 fn udp_config(text: &str) -> udp::Ppv2AuthConfig {
+    setup();
     udp::Ppv2AuthConfig {
         cfg: Arc::new(config::parse(text).unwrap()),
         counters: udp::Counters::default(),
@@ -59,7 +71,7 @@ fn a_refused_connection_is_not_admitted_by_a_later_on_data() {
     // done on the refusal path, and the done-guard returned Continue on that
     // second call -- admitting a connection with require_ppv2 on. Reproduced
     // exactly: a short non-PPv2 prefix, then more bytes.
-    let fc = ppv2_config(&format!("{{{ULA}}}"));
+    let fc = ppv2_config("{}");
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -87,8 +99,8 @@ fn non_ppv2_traffic_is_refused_unconditionally() {
     // after the NLB, so a client without a header reached the listener directly.
     // Holds for the label-only filter too, not just the enforcing one.
     for fc in [
-        ppv2_config(&format!("{{{ULA}}}")),
-        ppv2_auth_config(&format!("{{{ULA}}}")),
+        ppv2_config("{}"),
+        ppv2_auth_config("{}"),
     ] {
         let mut envoy = MockEnvoyListenerFilter::new();
         envoy
@@ -125,7 +137,7 @@ fn ppv2_auth_enforces_the_flat_list_after_labelling() {
         Some(b"vpce-somebody-else"),
     ));
 
-    let fc = ppv2_auth_config(&format!("{{{ULA},{TENANT}}}"));
+    let fc = ppv2_auth_config(TENANT);
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -139,7 +151,7 @@ fn ppv2_auth_enforces_the_flat_list_after_labelling() {
     let mut f = fc.new_listener_filter(&mut envoy);
     assert_eq!(f.on_data(&mut envoy, listed.len()), TcpStatus::Continue);
 
-    let fc = ppv2_auth_config(&format!("{{{ULA},{TENANT}}}"));
+    let fc = ppv2_auth_config(TENANT);
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -184,7 +196,7 @@ fn a_tenant_header_is_labelled_with_the_synthesized_address_and_drained() {
         &[10, 0, 1, 28],
         Some(b"vpce-0123456789abcdef0"),
     ));
-    let fc = ppv2_config(&format!("{{{ULA}}}"));
+    let fc = ppv2_config("{}");
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -229,7 +241,7 @@ fn a_partial_header_asks_for_the_total_not_the_remainder() {
     let total = full.len();
     let head = leak(full[..16].to_vec());
 
-    let fc = ppv2_config(&format!("{{{ULA}}}"));
+    let fc = ppv2_config("{}");
     let mut envoy = MockEnvoyListenerFilter::new();
     envoy
         .expect_get_buffer_chunk()
@@ -250,7 +262,7 @@ fn a_datagram_outside_the_allowlist_is_dropped() {
         &[10, 0, 1, 28],
         Some(b"vpce-somebody-else"),
     ));
-    let fc = udp_config(&format!("{{{ULA},{TENANT}}}"));
+    let fc = udp_config(TENANT);
     let mut envoy = MockEnvoyUdpListenerFilter::new();
     envoy
         .expect_get_datagram_data()
@@ -274,7 +286,7 @@ fn an_allowed_datagram_is_stripped_and_forwarded() {
     dg_vec.extend_from_slice(payload);
     let dg = leak(dg_vec);
 
-    let fc = udp_config(&format!("{{{ULA},{TENANT}}}"));
+    let fc = udp_config(TENANT);
     let mut envoy = MockEnvoyUdpListenerFilter::new();
     envoy
         .expect_get_datagram_data()
@@ -299,7 +311,7 @@ fn non_ppv2_datagrams_are_dropped_unconditionally() {
         &b"GET / HTTP/1.1\r\n\r\n"[..],
     ] {
         let dg: &'static [u8] = Box::leak(dg.to_vec().into_boxed_slice());
-        let fc = udp_config(&format!("{{{ULA}}}"));
+        let fc = udp_config("{}");
         let mut envoy = MockEnvoyUdpListenerFilter::new();
         envoy
             .expect_get_datagram_data()
@@ -319,7 +331,7 @@ fn an_empty_allowlist_denies_a_well_formed_tenant() {
         &[10, 0, 1, 28],
         Some(b"vpce-0123456789abcdef0"),
     ));
-    let fc = udp_config(&format!("{{{ULA}}}"));
+    let fc = udp_config("{}");
     let mut envoy = MockEnvoyUdpListenerFilter::new();
     envoy
         .expect_get_datagram_data()
@@ -452,7 +464,10 @@ fn refusals_carry_a_failure_reason_and_bump_the_denied_counter() {
     // the only signal at all on UDP. Underscore tokens, because the formatter
     // folds spaces to underscores anyway (stream_info_formatter.cc:2289).
     let fc = tcp::AuthConfig {
-        cfg: Arc::new(config::parse(SCOPED).unwrap()),
+        cfg: {
+            setup();
+            Arc::new(config::parse(SCOPED).unwrap())
+        },
         counters: tcp::Counters {
             denied: Some(EnvoyCounterId(7)),
             ..Default::default()
@@ -482,7 +497,10 @@ fn refusals_carry_a_failure_reason_and_bump_the_denied_counter() {
 #[test]
 fn non_ppv2_refusal_says_so_and_counts_separately() {
     let fc = tcp::Ppv2Config::enforcing(
-        Arc::new(config::parse(&format!("{{{ULA}}}")).unwrap()),
+        Arc::new({
+            setup();
+            config::parse("{}").unwrap()
+        }),
         tcp::Counters {
             not_ppv2: Some(EnvoyCounterId(9)),
             ..Default::default()
@@ -522,7 +540,10 @@ fn udp_denials_bump_the_only_signal_udp_has() {
         Some(b"vpce-somebody-else"),
     ));
     let fc = udp::Ppv2AuthConfig {
-        cfg: Arc::new(config::parse(&format!("{{{ULA},{TENANT}}}")).unwrap()),
+        cfg: {
+            setup();
+            Arc::new(config::parse(TENANT).unwrap())
+        },
         counters: udp::Counters {
             denied: Some(EnvoyCounterId(3)),
             ..Default::default()

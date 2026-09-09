@@ -202,16 +202,14 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
         if self.done {
             return Status::Continue;
         }
-        // Pinned configs always have one (lib.rs enforces `ula`); a slim config
-        // waits on a `table` carrier, and until it lands this refuses -- deny by
-        // default is the whole point.
-        let table = self.cfg.table_now();
-        let Some(scheme) = table.scheme.as_ref() else {
+        // Until a `table` carrier lands there is nothing to synthesize against,
+        // so refuse -- deny by default is the whole point.
+        let Some(table) = config::published().1 else {
             return self.refuse(envoy, "no_identity_table");
         };
 
         // The buffer borrow ends here; carry out owned values only.
-        match inspect(envoy, scheme) {
+        match inspect(envoy, &table.scheme) {
             Decision::Need(n) => {
                 self.want = n;
                 Status::StopIteration

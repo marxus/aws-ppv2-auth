@@ -89,12 +89,12 @@ enum Decision {
 
 impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
     fn on_data(&mut self, envoy: &mut ELF) -> Status {
-        // Pinned configs always have one (lib.rs enforces `ula`); a slim config
-        // denies every datagram until a `table` carrier lands.
-        let table = self.cfg.table_now();
-        let Some(scheme) = table.scheme.as_ref() else {
+        // Until a `table` carrier lands there is nothing to synthesize against:
+        // deny every datagram.
+        let Some(table) = config::published().1 else {
             return Status::StopIteration;
         };
+        let scheme = &table.scheme;
         // Single chunk (every real NLB datagram) borrows in place; multi-chunk joins.
         let decision = {
             let (chunks, total) = envoy.get_datagram_data();

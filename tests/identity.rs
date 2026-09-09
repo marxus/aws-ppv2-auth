@@ -281,7 +281,7 @@ fn an_encoded_member_covers_what_the_wire_synthesizes() {
     // allow list admits exactly the connections whose headers synthesize there.
     let scheme = plain();
     let covers = |member: &str, h: &ppv2::Header| {
-        let entry = identity::encode_member(Some(&scheme), member).unwrap();
+        let entry = identity::encode_member(&scheme, member);
         let set = cidr::build(&entry).unwrap();
         set.contains(identity::to_u128(synthesize(&scheme, h)))
     };
@@ -310,7 +310,7 @@ fn a_site_owned_source_and_the_wire_meet_in_site_space() {
     // exactly the connections whose headers synthesize into that site.
     let scheme = with_sites(); // site 7 by vpce, site 2 by 203.0.113.0/120-mapped prefix
     let covers = |member: &str, h: &ppv2::Header| {
-        let entry = identity::encode_member(Some(&scheme), member).unwrap();
+        let entry = identity::encode_member(&scheme, member);
         let set = cidr::build(&entry).unwrap();
         set.contains(identity::to_u128(synthesize(&scheme, h)))
     };
@@ -356,7 +356,7 @@ fn overlapping_site_ranges_split_and_the_contest_goes_to_site_0() {
 
     // Config: same three answers -- site, quarantine, and a spanning range that
     // encodes as the kind-4 lift because it crosses zones.
-    let enc = |m: &str| identity::encode_member(Some(&s), m).unwrap();
+    let enc = |m: &str| identity::encode_member(&s, m);
     assert_eq!(enc("203.0.113.0/25"), "fd00:dead:beef:b1a:0:9::/96");
     assert_eq!(enc("203.0.113.128/25"), "fd00:dead:beef:b1a::/96");
     assert_eq!(enc("203.0.113.0/24"), "fd00:dead:beef:4::cb00:7100/120");

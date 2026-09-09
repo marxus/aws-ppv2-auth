@@ -133,17 +133,21 @@ filter_config:
 A scope may name **several hostnames** sharing one list — the shape Envoy's
 `ServerNameMatcher` uses, where one `domains` list maps to one action.
 
-Each filter takes one shape, and anything else fails the listener:
+**The table is the king.** `ula`, `sites` and `groups` ride exactly once per
+pod, on a `table` filter parked on a listener nothing routes (a Gateway's
+mandatory bootstrap listener is perfect). At config load it publishes the parsed
+table process-wide; enforcing filters carry **rules only** and re-expand them
+whenever the published table moves. Patching a listener *means* consuming the
+table — there is no self-contained mode, no opt-in marker, and a rules config
+smuggling `ula`/`sites`/`groups` fails its listener loudly. Until a carrier
+lands, every enforcing filter denies (`no_identity_table`).
 
 | filter | config | meaning |
 |---|---|---|
-| `ppv2_auth` | `ula` `sites` `groups` `allow` | the whole job in one — plain TCP, and UDP |
-| `ppv2` | `ula` `sites` | synthesize and label; it never denies, so it takes no rules |
-| `auth` | `scopes` + `ula` `sites` `groups` | read the label a `ppv2` filter left — the TLS chain |
-
-`ula` and `sites` describe how a header is encoded, so the header-parsing filters
-need them per connection. `auth` never parses a header, but its rule entries must
-**encode the way the wire does**, so it carries the same table for that alone.
+| `table` | `ula` `sites` `groups` | the carrier — enforces nothing, publishes everything |
+| `ppv2_auth` | `allow` | the whole job in one — plain TCP, and UDP |
+| `ppv2` | *(empty)* | synthesize and label; it never denies, so it takes no rules |
+| `auth` | `scopes` | read the label a `ppv2` filter left — the TLS chain |
 
 ### The source grammar
 
@@ -168,15 +172,15 @@ site that appears later re-renders the config and the ref resolves for real. The
 only refusal is a source that needs encoding with no `ula` to encode into.
 
 ```yaml
-    ula: fd0b:1003:5ec0::/48
-    sites:
-      "1": [vpce-028ff61de1d1fea8c, 3.126.239.93]
-      "2": [203.0.113.0/24]
-    groups:
-      tenant-a: [vpce-028ff61de1d1fea8c]    # site 1 owns it -> encodes as !1
-      home:     [81.199.237.15, 2a02:ba0:10a8:3427::/64]
-      trusted:  ["@tenant-a", "@home", "!2"]
-    allow: ["@trusted"]
+# the carrier's filter_config value          # an enforcer's filter_config value
+ula: fd0b:1003:5ec0::/48                     allow: ["@trusted"]
+sites:
+  "1": [vpce-028ff61de1d1fea8c, 3.126.239.93]
+  "2": [203.0.113.0/24]
+groups:
+  tenant-a: [vpce-028ff61de1d1fea8c]    # site 1 owns it -> encodes as !1
+  home:     [81.199.237.0/24, 2a02:ba0:10a8:3427::/64]
+  trusted:  ["@tenant-a", "@home", "!2"]
 ```
 
 `sites` and `groups` are maps — CEL's `transformMapEntry` folds a CR collection

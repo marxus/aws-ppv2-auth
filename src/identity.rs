@@ -363,25 +363,21 @@ pub fn parse_prefix(text: &str) -> Result<Prefix, &'static str> {
 ///   ipv4[/N]    -> kind-4 lift, /(96+N)
 ///   label       -> kind-1 hash of the whole string, /96
 ///
-/// TOTAL over strings, like the wire: a label is anything that is not a valid
-/// address or a valid !site -- "10.0.0.1/99", "!x", "fd00::1/129" included --
-/// because the packet side hashes the vpce bytes verbatim and this must land on
-/// the same address. The one refusal is a source with no `scheme` to encode into.
-pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, String> {
-    let need = || -> Result<&Scheme, String> {
-        scheme.ok_or_else(|| format!("{member:?} needs `ula` to encode"))
-    };
-
+/// TOTAL over strings, like the wire, full stop: a label is anything that is not
+/// a valid address or a resolvable !site -- "10.0.0.1/99", "!x", "fd00::1/129"
+/// included -- because the packet side hashes the vpce bytes verbatim and this
+/// must land on the same address. A scheme always exists (the table owns it), so
+/// there is no failure path at all.
+pub fn encode_member(sch: &Scheme, member: &str) -> String {
     // A site ref resolves only against a DECLARED site -- "!5" with no site 5 is
     // an unresolvable ref, and everything unresolvable is a label, same as
-    // "@ghost". A site declared later (watch-fed) re-renders the config and the
-    // ref resolves then. "!0" always resolves: the quarantine space is
-    // system-owned, minted by contests rather than declared, and a group like
-    // `unknown-site: ["!0"]` is how contested traffic is admitted for examination.
+    // "@ghost". A site declared later re-renders the table and the ref resolves
+    // then. "!0" always resolves: the quarantine space is system-owned, minted by
+    // contests rather than declared, and a group like `unknown-site: ["!0"]` is
+    // how contested traffic is admitted for examination.
     if let Some(id) = member.strip_prefix('!').and_then(|t| t.parse::<u16>().ok()) {
-        let sch = need()?;
         if id == SITE_CONTESTED || sch.sites.iter().any(|s| s.id == id) {
-            return Ok(site_space(&sch.prefix, id));
+            return site_space(&sch.prefix, id);
         }
     }
 
@@ -398,41 +394,37 @@ pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, St
     };
 
     if let (Ok(v4), Some(b)) = (addr_text.parse::<Ipv4Addr>(), bits(32)) {
-        let sch = need()?;
         // Mapped form, because that is how site cidrs hold v4.
         let base = 0xffff_0000_0000u128 | u32::from_be_bytes(v4.octets()) as u128;
         let (start, end) = range_of(base, 96 + b);
         if let Some(id) = sch.range_site(start, end) {
-            return Ok(site_space(&sch.prefix, id));
+            return site_space(&sch.prefix, id);
         }
         let mut out = [0u8; 16];
         out[..6].copy_from_slice(&sch.prefix);
         out[6..8].copy_from_slice(&KIND_ADDR.to_be_bytes());
         out[12..16].copy_from_slice(&v4.octets());
-        return Ok(std::format!("{}/{}", format(out).as_str(), 96 + b as u32));
+        return std::format!("{}/{}", format(out).as_str(), 96 + b as u32);
     }
     if let (Ok(v6), Some(b)) = (addr_text.parse::<Ipv6Addr>(), bits(128)) {
         // v6 passes through UNLESS a site claims the range -- the wire labels
         // those connections with the site space, so the config must too.
-        if let Some(sch) = scheme {
-            let (start, end) = range_of(to_u128(v6.octets()), b);
-            if let Some(id) = sch.range_site(start, end) {
-                return Ok(site_space(&sch.prefix, id));
-            }
+        let (start, end) = range_of(to_u128(v6.octets()), b);
+        if let Some(id) = sch.range_site(start, end) {
+            return site_space(&sch.prefix, id);
         }
-        return Ok(std::format!("{v6}/{b}"));
+        return std::format!("{v6}/{b}");
     }
 
-    let sch = need()?;
     if let Some(id) = sch.label_site(member.as_bytes()) {
-        return Ok(site_space(&sch.prefix, id));
+        return site_space(&sch.prefix, id);
     }
     let digest = Sha256::digest(member.as_bytes());
     let mut out = [0u8; 16];
     out[..6].copy_from_slice(&sch.prefix);
     out[6..8].copy_from_slice(&KIND_VPCE.to_be_bytes());
     out[8..12].copy_from_slice(&digest[..4]);
-    Ok(std::format!("{}/96", format(out).as_str()))
+    std::format!("{}/96", format(out).as_str())
 }
 
 /// "!*": every declared site's space -- the union @known-sites would name, kept
