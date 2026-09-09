@@ -680,3 +680,55 @@ fn identical_tables_are_shared_and_listener_rules_are_not() {
     let d = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":[]}"#).unwrap();
     assert!(!std::sync::Arc::ptr_eq(&a.table, &d.table));
 }
+
+#[test]
+fn a_subscriber_follows_the_published_table() {
+    // ONE test on purpose: the published table is process state shared by every
+    // test thread, so its whole lifecycle lives here. Subscribers judge through
+    // whatever a `table` carrier last published; before any carrier: deny-all.
+    let consumer =
+        config::parse(r#"{"subscribe":true,"allow":["@tenant-a","!1"]}"#).unwrap();
+    assert!(ppv2_auth::validate_ppv2_auth(&consumer).is_ok());
+    assert!(!consumer.carries_table());
+
+    // Publish via the same path lib.rs uses for a `table` carrier config.
+    let carrier = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "sites":{"1":["vpce-a"]},
+            "groups":{"tenant-a":["203.0.113.7"]}}"#,
+    )
+    .unwrap();
+    assert!(ppv2_auth::validate_table(&carrier).is_ok());
+    config::publish(carrier.table.clone());
+    assert!(consumer.permits_unscoped(ip("fd00:dead:beef:b1a:0:1:a01:1"))); // !1
+    assert!(consumer.permits_unscoped(ip("fd00:dead:beef:4::cb00:7107"))); // @tenant-a's lift
+    assert!(!consumer.permits_unscoped(ip("fd00:dead:beef:b1a:0:2::")));
+
+    // A new table re-expands the same raw rules: tenant-a moves, site 2 appears.
+    let carrier2 = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "sites":{"1":["vpce-a"],"2":[]},
+            "groups":{"tenant-a":["!2"]}}"#,
+    )
+    .unwrap();
+    config::publish(carrier2.table.clone());
+    assert!(consumer.permits_unscoped(ip("fd00:dead:beef:b1a:0:2::"))); // @tenant-a is !2 now
+    assert!(!consumer.permits_unscoped(ip("fd00:dead:beef:4::cb00:7107"))); // old lift gone
+    assert!(consumer.permits_unscoped(ip("fd00:dead:beef:b1a:0:1:a01:1"))); // !1 still
+
+    // Scoped subscribers re-expand too, and a carrier must carry, not enforce.
+    let scoped = config::parse(
+        r#"{"subscribe":true,"scopes":[{"sni":["x.test"],"allow":["!1"]}]}"#,
+    )
+    .unwrap();
+    assert!(ppv2_auth::validate_auth(&scoped).is_ok());
+    assert!(scoped.permits(b"x.test", ip("fd00:dead:beef:b1a:0:1::5")));
+    // (Checked on the EXPANDED set: an allow of only-unresolvable refs expands
+    // empty and slips by, which is harmless -- a carrier never enforces.)
+    let not_a_carrier =
+        config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["10.0.0.0/8"]}"#).unwrap();
+    assert!(ppv2_auth::validate_table(&not_a_carrier).is_err());
+
+    // Mixing subscribe with table fields is ambiguity, refused at parse.
+    assert!(config::parse(r#"{"subscribe":true,"ula":"fd00:dead:beef::/48"}"#).is_err());
+}

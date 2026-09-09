@@ -44,13 +44,66 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub struct Config {
     /// The identity table -- ula, sites, groups -- INTERNED per process: every
     /// filter on this pod whose table content is identical shares one Arc, one
-    /// parse, one set of match indices. allow/scopes below are the listener's
-    /// own concern and stay per-filter.
+    /// parse, one set of match indices. A SLIM config (no ula, no sites, no
+    /// groups) pins the empty table and reads the PUBLISHED one instead -- see
+    /// `publish`; its rules re-expand lazily whenever the published table moves.
     pub table: Arc<Table>,
-    /// Used when `scopes` is absent.
+    /// Used when `scopes` is absent. The pinned expansion; a slim config keeps
+    /// this empty and judges through its cache.
     pub allow: cidr::Set,
     /// None = flat-list mode. Some([]) = SNI mode, nothing claimed, deny all -- the appendable base state.
     pub scopes: Option<Vec<Scope>>,
+    /// Some = subscriber: rules kept raw, expanded against the published table.
+    slim: Option<Slim>,
+}
+
+/// The raw rules of a slim config plus their expansion, rebuilt when the
+/// published table's generation moves. Deny-safe at every stage: before any
+/// table is published the empty table expands @refs to nothing and refuses
+/// sources that need encoding (logged, empty set, deny-all).
+#[derive(Debug)]
+struct Slim {
+    raw_allow: Vec<String>,
+    raw_scopes: Option<Vec<(Vec<Pattern>, Vec<String>)>>,
+    cache: std::sync::RwLock<Expanded>,
+}
+
+#[derive(Debug)]
+struct Expanded {
+    gen: u64,
+    allow: cidr::Set,
+    scopes: Option<Vec<Scope>>,
+}
+
+/// The process-published table: what a `table` carrier filter last delivered.
+/// Starts empty (generation 0), so slim consumers deny until a carrier lands.
+static PUBLISHED: OnceLock<std::sync::RwLock<(u64, Arc<Table>)>> = OnceLock::new();
+
+fn published_cell() -> &'static std::sync::RwLock<(u64, Arc<Table>)> {
+    PUBLISHED.get_or_init(|| {
+        std::sync::RwLock::new((
+            0,
+            Arc::new(Table {
+                scheme: None,
+                groups: graph::Graph::default(),
+            }),
+        ))
+    })
+}
+
+/// Deliver a new table to every slim consumer on this pod. Same Arc twice is a
+/// no-op -- interning makes an unchanged carrier config hit exactly that.
+pub fn publish(table: Arc<Table>) {
+    let mut w = published_cell().write().unwrap();
+    if !Arc::ptr_eq(&w.1, &table) {
+        w.0 += 1;
+        w.1 = table;
+    }
+}
+
+pub fn published() -> (u64, Arc<Table>) {
+    let r = published_cell().read().unwrap();
+    (r.0, r.1.clone())
 }
 
 /// What every listener shares: how a header encodes (scheme) and what names mean
@@ -65,8 +118,34 @@ pub struct Table {
 }
 
 impl Config {
+    /// The PINNED scheme -- what this config itself carried. A slim config
+    /// answers None here; its per-connection scheme comes from `table_now`.
     pub fn scheme(&self) -> Option<&identity::Scheme> {
         self.table.scheme.as_ref()
+    }
+
+    /// True when this config carried its own identity table (any of ula, sites,
+    /// groups); false = slim, fed by the published table.
+    pub fn carries_table(&self) -> bool {
+        self.slim.is_none()
+    }
+
+    /// A scope with no `sni` can never match -- dead config, checked by
+    /// validate_auth in BOTH modes (a slim config's Scope structs do not exist
+    /// until expansion, so the pinned `scopes` field cannot answer this).
+    pub fn has_nameless_scope(&self) -> bool {
+        match &self.slim {
+            None => self
+                .scopes
+                .iter()
+                .flatten()
+                .any(|scope| scope.names.is_empty()),
+            Some(slim) => slim
+                .raw_scopes
+                .iter()
+                .flatten()
+                .any(|(names, _)| names.is_empty()),
+        }
     }
 }
 
@@ -97,7 +176,7 @@ pub struct Scope {
 }
 
 /// One `sni` entry, lowercased; `*.foo.com` is `Suffix("foo.com")` per domain_matcher.h:264.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pattern {
     Exact(String),
     Suffix(String),
@@ -126,8 +205,14 @@ fn eq_fold(pat: &str, sni: &[u8]) -> bool {
 impl Config {
     /// Deny by default: false unless a list covers this identity.
     pub fn permits(&self, sni: &[u8], addr: u128) -> bool {
-        self.allowlist_for(sni)
-            .is_some_and(|set| set.contains(addr))
+        match &self.slim {
+            None => allowlist_for(&self.allow, &self.scopes, sni).is_some_and(|set| set.contains(addr)),
+            Some(slim) => {
+                slim.refresh(self);
+                let cache = slim.cache.read().unwrap();
+                allowlist_for(&cache.allow, &cache.scopes, sni).is_some_and(|set| set.contains(addr))
+            }
+        }
     }
 
     /// Flat-list judgment via `permits`, so stray scopes deny instead of being ignored.
@@ -135,10 +220,58 @@ impl Config {
         self.permits(b"", addr)
     }
 
-    /// ServerNameMatcher order (domain_matcher.h:78-101): exact, then wildcards longest-suffix-first.
-    fn allowlist_for(&self, sni: &[u8]) -> Option<&cidr::Set> {
-        let Some(scopes) = &self.scopes else {
-            return Some(&self.allow);
+    /// The table this connection should encode against: the pinned one, or for a
+    /// slim config whatever is currently published. An Arc clone, so the borrow
+    /// never blocks the publisher.
+    pub fn table_now(&self) -> Arc<Table> {
+        match &self.slim {
+            None => self.table.clone(),
+            Some(_) => published().1,
+        }
+    }
+}
+
+impl Slim {
+    /// Re-expand if the published table moved. Expansion failures (a source that
+    /// needs encoding before any carrier delivered a ula) log once per generation
+    /// and leave DENY-ALL -- never a stale allow.
+    fn refresh(&self, _cfg: &Config) {
+        let (gen, table) = published();
+        if self.cache.read().unwrap().gen == gen {
+            return;
+        }
+        let mut w = self.cache.write().unwrap();
+        if w.gen == gen {
+            return; // another worker already rebuilt
+        }
+        let allow = build(&self.raw_allow, &table).unwrap_or_else(|e| {
+            eprintln!("ppv2-auth: allow does not expand against the published table (gen {gen}): {e}; denying all");
+            cidr::build("").unwrap()
+        });
+        let scopes = self.raw_scopes.as_ref().map(|list| {
+            list.iter()
+                .map(|(names, raw)| Scope {
+                    names: names.clone(),
+                    allow: build(raw, &table).unwrap_or_else(|e| {
+                        eprintln!("ppv2-auth: scope does not expand against the published table (gen {gen}): {e}; denying scope");
+                        cidr::build("").unwrap()
+                    }),
+                })
+                .collect()
+        });
+        *w = Expanded { gen, allow, scopes };
+    }
+}
+
+/// ServerNameMatcher order (domain_matcher.h:78-101): exact, then wildcards longest-suffix-first.
+fn allowlist_for<'a>(
+    allow: &'a cidr::Set,
+    scopes: &'a Option<Vec<Scope>>,
+    sni: &[u8],
+) -> Option<&'a cidr::Set> {
+    {
+        let Some(scopes) = scopes else {
+            return Some(allow);
         };
         // Empty SNI claims nothing, per domain_matcher.h:74-76.
         if sni.is_empty() {
@@ -195,6 +328,12 @@ struct Raw {
     /// this shape, dynamic keys included.
     #[serde(default)]
     groups: BTreeMap<String, Vec<String>>,
+    /// EXPLICIT opt-in to the published table: the config carries rules only and
+    /// re-expands them whenever a `table` carrier publishes. Explicit, never
+    /// inferred from a missing `ula` -- a forgotten field must stay a loud parse
+    /// error, not a silent deny-all subscriber.
+    #[serde(default)]
+    subscribe: bool,
 }
 
 #[derive(Deserialize)]
@@ -297,6 +436,16 @@ fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: Raw = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
+    // A subscriber carries rules only; mixing in table fields would make it
+    // ambiguous whose table applies, so that is refused outright.
+    if raw.subscribe && (raw.ula.is_some() || !raw.sites.is_empty() || !raw.groups.is_empty()) {
+        return Err(
+            "`subscribe` means the table comes from the `table` carrier; drop `ula`/`sites`/`groups`"
+                .to_string(),
+        );
+    }
+    let slim_mode = raw.subscribe;
+
     // The table's identity is its content; allow/scopes are excluded on purpose.
     let key = serde_json::to_string(&(&raw.ula, &raw.sites, &raw.groups))
         .map_err(|e| e.to_string())?;
@@ -333,6 +482,36 @@ pub fn parse(text: &str) -> Result<Config, String> {
         Ok(Table { scheme, groups })
     })?;
 
+    if slim_mode {
+        let raw_scopes = raw.scopes.map(|list| {
+            list.into_iter()
+                .map(|s| {
+                    (
+                        s.sni.iter().map(|n| Pattern::parse(n)).collect::<Vec<_>>(),
+                        s.allow,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let slim = Slim {
+            raw_allow: raw.allow,
+            raw_scopes,
+            // Stale on arrival (no generation is u64::MAX), so the first
+            // connection expands against whatever is published by then.
+            cache: std::sync::RwLock::new(Expanded {
+                gen: u64::MAX,
+                allow: cidr::build("").map_err(str::to_string)?,
+                scopes: None,
+            }),
+        };
+        return Ok(Config {
+            table,
+            allow: cidr::build("").map_err(str::to_string)?,
+            scopes: slim.raw_scopes.as_ref().map(|_| Vec::new()),
+            slim: Some(slim),
+        });
+    }
+
     let allow = build(&raw.allow, &table)?;
     let scopes = match raw.scopes {
         None => None,
@@ -352,5 +531,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
         table,
         allow,
         scopes,
+        slim: None,
     })
 }

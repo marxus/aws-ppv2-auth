@@ -3,9 +3,15 @@
 //! One shared object, three filters, chosen by `filter_name`. Each name is a
 //! position in a chain, and takes exactly one config shape:
 //!
-//!   ppv2_auth   parse the header, synthesize, enforce a flat allowlist   `ula` + `allow`
-//!   ppv2        parse the header, synthesize, label and drain only       `ula`
-//!   auth        read the label, scope by SNI, enforce                    `scopes`
+//!   ppv2_auth   parse the header, synthesize, enforce a flat allowlist   `allow` (+ table, or slim)
+//!   ppv2        parse the header, synthesize, label and drain only       table, or slim
+//!   auth        read the label, scope by SNI, enforce                    `scopes` (+ table, or slim)
+//!   table       carry the identity table for every slim filter           `ula` + `sites` + `groups`
+//!
+//! The table -- ula, sites, groups -- may ride in each filter's own config
+//! (self-contained) or ONCE per pod on a `table` filter parked on a listener
+//! nothing routes; the other filters then go SLIM (rules only) and re-expand
+//! whenever the published table moves. Slim filters deny until a carrier lands.
 //!
 //!   tcp  -> [ppv2_auth, ...]
 //!   udp  -> [ppv2_auth, ...]
@@ -59,8 +65,15 @@ fn new_listener_filter_config<EC: EnvoyListenerFilterConfig, ELF: EnvoyListenerF
             let counters = counters(name, envoy_filter_config);
             Some(Box::new(tcp::AuthConfig { cfg, counters }))
         }
+        "table" => {
+            let cfg = load(config_bytes, validate_table)?;
+            config::publish(cfg.table.clone());
+            Some(Box::new(tcp::TableConfig))
+        }
         _ => {
-            eprintln!("ppv2-auth: unknown filter_name {name:?}; expected ppv2_auth, ppv2 or auth");
+            eprintln!(
+                "ppv2-auth: unknown filter_name {name:?}; expected ppv2_auth, ppv2, auth or table"
+            );
             None
         }
     }
@@ -71,14 +84,24 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
     name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
-    if name != "ppv2_auth" {
-        // The UDP ABI has no way to hand an identity onward, so UDP is one filter.
-        eprintln!("ppv2-auth: UDP supports only filter_name ppv2_auth, got {name:?}");
-        return None;
+    match name {
+        "ppv2_auth" => {
+            let cfg = load(config_bytes, validate_ppv2_auth)?;
+            let counters =
+                stats::Counters::register(name, |n| envoy_filter_config.define_counter(n).ok());
+            Some(Box::new(udp::Ppv2AuthConfig { cfg, counters }))
+        }
+        "table" => {
+            let cfg = load(config_bytes, validate_table)?;
+            config::publish(cfg.table.clone());
+            Some(Box::new(udp::TableConfig))
+        }
+        _ => {
+            // The UDP ABI has no way to hand an identity onward, so UDP enforcement is one filter.
+            eprintln!("ppv2-auth: UDP supports only filter_name ppv2_auth or table, got {name:?}");
+            None
+        }
     }
-    let cfg = load(config_bytes, validate_ppv2_auth)?;
-    let counters = stats::Counters::register(name, |n| envoy_filter_config.define_counter(n).ok());
-    Some(Box::new(udp::Ppv2AuthConfig { cfg, counters }))
 }
 
 /// Prefixed with the filter_name: all filters share one metrics namespace, so
@@ -112,8 +135,10 @@ fn load(
 }
 
 /// `ppv2` only labels and drains; a rule here would read as applied and do nothing.
+/// A subscriber (`subscribe: true`) is legal: the published table synthesizes,
+/// and until a carrier lands every connection is refused.
 pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.scheme().is_none() {
+    if cfg.carries_table() && cfg.scheme().is_none() {
         return Err("`ppv2` needs `ula` to synthesize an identity");
     }
     if !cfg.allow.is_empty() || cfg.scopes.is_some() {
@@ -123,12 +148,25 @@ pub fn validate_ppv2(cfg: &config::Config) -> Result<(), &'static str> {
 }
 
 /// `ppv2_auth`: the whole job in one filter (TCP and UDP); empty `allow` is deny-all, like an empty SG.
+/// A subscriber is legal -- see validate_ppv2.
 pub fn validate_ppv2_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.scheme().is_none() {
+    if cfg.carries_table() && cfg.scheme().is_none() {
         return Err("`ppv2_auth` needs `ula` to synthesize an identity");
     }
     if cfg.scopes.is_some() {
         return Err("`ppv2_auth` runs before tls_inspector, so there is no SNI yet; use `auth`");
+    }
+    Ok(())
+}
+
+/// `table` carries identity for every slim filter on the pod, and nothing else:
+/// no rules -- it enforces nothing -- and it must actually have a table to carry.
+pub fn validate_table(cfg: &config::Config) -> Result<(), &'static str> {
+    if cfg.scheme().is_none() {
+        return Err("`table` needs `ula`; carrying an empty table would deny every slim filter");
+    }
+    if !cfg.allow.is_empty() || cfg.scopes.is_some() {
+        return Err("`table` carries identity, not rules; put `allow`/`scopes` on the enforcing filters");
     }
     Ok(())
 }
@@ -146,12 +184,8 @@ pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
         return Err("`auth` ignores a top-level `allow`; put those rules in a scope");
     }
     // A nameless scope can never match: dead config, likely a tenant CR mistake.
-    if cfg
-        .scopes
-        .iter()
-        .flatten()
-        .any(|scope| scope.names.is_empty())
-    {
+    // Checked through the Config so slim raw scopes are covered too.
+    if cfg.has_nameless_scope() {
         return Err("a scope needs at least one `sni`");
     }
     Ok(())

@@ -202,9 +202,12 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for Ppv2Filter {
         if self.done {
             return Status::Continue;
         }
-        // Unreachable: lib.rs rejects a config without `ula`.
-        let Some(scheme) = self.cfg.scheme() else {
-            return self.refuse(envoy, "missing_ula");
+        // Pinned configs always have one (lib.rs enforces `ula`); a slim config
+        // waits on a `table` carrier, and until it lands this refuses -- deny by
+        // default is the whole point.
+        let table = self.cfg.table_now();
+        let Some(scheme) = table.scheme.as_ref() else {
+            return self.refuse(envoy, "no_identity_table");
         };
 
         // The buffer borrow ends here; carry out owned values only.
@@ -315,6 +318,34 @@ impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for AuthFilter {
             return Status::StopIteration;
         }
         self.refuse(envoy, "unexpected_on_data")
+    }
+}
+
+// --- table: the carrier -- config only, packets pass untouched ----------------
+
+/// Lives on a listener nothing routes (the gateway's bootstrap listener): its
+/// whole job happened at config load, when lib.rs published the table. Traffic,
+/// if any ever arrives, continues unjudged -- this filter carries identity for
+/// OTHERS and enforces nothing itself.
+pub struct TableConfig;
+
+impl<ELF: EnvoyListenerFilter> ListenerFilterConfig<ELF> for TableConfig {
+    fn new_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn ListenerFilter<ELF>> {
+        Box::new(TableFilter)
+    }
+}
+
+struct TableFilter;
+
+impl<ELF: EnvoyListenerFilter> ListenerFilter<ELF> for TableFilter {
+    fn on_accept(&mut self, _envoy: &mut ELF) -> Status {
+        Status::Continue
+    }
+    fn max_read_bytes(&mut self, _envoy: &mut ELF) -> usize {
+        0
+    }
+    fn on_data(&mut self, _envoy: &mut ELF, _data_length: usize) -> Status {
+        Status::Continue
     }
 }
 

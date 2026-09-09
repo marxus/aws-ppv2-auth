@@ -13,6 +13,23 @@ type Status = abi::envoy_dynamic_module_type_on_udp_listener_filter_status;
 
 pub use crate::stats::Counters;
 
+/// The carrier on UDP -- see tcp.rs TableConfig. Datagrams pass untouched.
+pub struct TableConfig;
+
+impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for TableConfig {
+    fn new_udp_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn UdpListenerFilter<ELF>> {
+        Box::new(TableFilter)
+    }
+}
+
+struct TableFilter;
+
+impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for TableFilter {
+    fn on_data(&mut self, _envoy: &mut ELF) -> Status {
+        Status::Continue
+    }
+}
+
 fn bump<ELF: EnvoyUdpListenerFilter>(envoy: &ELF, id: Option<EnvoyCounterId>) {
     if let Some(id) = id {
         let _ = envoy.increment_counter(id, 1);
@@ -52,8 +69,10 @@ enum Decision {
 
 impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for Ppv2AuthFilter {
     fn on_data(&mut self, envoy: &mut ELF) -> Status {
-        // Unreachable: lib.rs rejects a UDP config without `ula`. Deny anyway.
-        let Some(scheme) = self.cfg.scheme() else {
+        // Pinned configs always have one (lib.rs enforces `ula`); a slim config
+        // denies every datagram until a `table` carrier lands.
+        let table = self.cfg.table_now();
+        let Some(scheme) = table.scheme.as_ref() else {
             return Status::StopIteration;
         };
         // Single chunk (every real NLB datagram) borrows in place; multi-chunk joins.
