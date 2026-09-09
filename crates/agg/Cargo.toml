@@ -1,0 +1,22 @@
+[package]
+name = "identity-agg"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Prototype: watch IdentityGroup CRs, hold the resolved membership graph in memory, expose it over HTTP for inspection. Zero k8s writes."
+publish = false
+
+[dependencies]
+kube = { version = "0.99", default-features = false, features = ["client", "derive", "runtime", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+futures = "0.3"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+# kube-rs picks rustls but leaves the crypto provider unresolved -- pick one explicitly, install at main start.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
