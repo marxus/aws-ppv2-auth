@@ -111,7 +111,8 @@ fn each_filter_name_takes_exactly_one_config_shape() {
     // auth: read the label, scope by SNI. The TLS chain.
     assert!(validate_auth(&config::parse(scopes).unwrap()).is_ok());
     assert!(validate_auth(&config::parse(ula_allow).unwrap()).is_err());
-    assert!(validate_auth(&config::parse(both).unwrap()).is_err());
+    // `ula` rides along on `auth` since members need it to encode -- see validate_auth.
+    assert!(validate_auth(&config::parse(both).unwrap()).is_ok());
 }
 
 #[test]
@@ -383,4 +384,165 @@ fn one_id_cannot_appear_twice() {
         r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":1,"members":["vpce-a"]},{"id":1,"members":["vpce-b"]}]}"#
     )
     .is_err());
+}
+
+// --- groups and @refs --------------------------------------------------------
+
+#[test]
+fn an_allow_entry_may_reference_a_group() {
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "groups":[{"name":"tenant-a","members":["fd00:dead:beef:1::/64"]}],
+            "allow":["@tenant-a","fd00:dead:beef:9::/64"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip(TENANT)));
+    assert!(c.permits_unscoped(ip(OTHER)));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:5::1")));
+}
+
+#[test]
+fn groups_nest_and_a_diamond_resolves_once() {
+    // top -> a, b; both -> leaf. The leaf's CIDR lands once: overlaps collapse in
+    // cidr::build, so the set has one range however many paths reached it.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "groups":[
+              {"name":"leaf","members":["fd00:dead:beef:1::/64"]},
+              {"name":"a","members":["@leaf"]},
+              {"name":"b","members":["@leaf"]},
+              {"name":"top","members":["@a","@b"]}],
+            "allow":["@top"]}"#,
+    )
+    .unwrap();
+    assert_eq!(c.allow.len(), 1);
+    assert!(c.permits_unscoped(ip(TENANT)));
+}
+
+#[test]
+fn an_unknown_group_ref_contributes_nothing() {
+    // Deny-safe, and deliberately not an error: with watch-fed groups a ref can
+    // exist before its group does, and an ordering gap must not flap the listener.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","allow":["@ghost","fd00:dead:beef:1::/64"]}"#,
+    )
+    .unwrap();
+    assert_eq!(c.allow.len(), 1);
+    assert!(c.permits_unscoped(ip(TENANT)));
+    assert!(!c.permits_unscoped(ip(OTHER)));
+}
+
+#[test]
+fn a_cycle_terminates_and_yields_what_it_passed() {
+    // Revisits skip -- same rule as unknown refs, no special cycle handling. The
+    // literals seen along the way still land.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "groups":[{"name":"a","members":["@b","fd00:dead:beef:1::/64"]},{"name":"b","members":["@a","fd00:dead:beef:9::/64"]}],
+            "allow":["@a"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip(TENANT)));
+    assert!(c.permits_unscoped(ip(OTHER)));
+    // Self-reference is the one-node cycle.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","groups":[{"name":"a","members":["@a","fd00:dead:beef:1::/64"]}],"allow":["@a"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip(TENANT)));
+}
+
+#[test]
+fn scoped_allow_lists_take_refs_too() {
+    let c = config::parse(
+        r#"{"groups":[{"name":"tenant-a","members":["fd00:dead:beef:1::/64"]}],
+            "scopes":[{"sni":["l7.mgmt.test"],"allow":["@tenant-a"]}]}"#,
+    )
+    .unwrap();
+    assert!(validate_auth(&c).is_ok());
+    assert!(c.permits(b"l7.mgmt.test", ip(TENANT)));
+    assert!(!c.permits(b"l7.mgmt.test", ip(OTHER)));
+}
+
+#[test]
+fn unreferenced_groups_are_the_appendable_base_state() {
+    // Same story as `scopes: []`: the base config ships the groups, tenant CRs
+    // append entries that reference them. Until then: deny-all, valid.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","groups":[{"name":"tenant-a","members":["fd00:dead:beef:1::/64"]}]}"#,
+    )
+    .unwrap();
+    assert!(validate_ppv2_auth(&c).is_ok());
+    assert!(!c.permits_unscoped(ip(TENANT)));
+}
+
+#[test]
+fn members_encode_like_the_wire_does() {
+    // The five member shapes, each landing where the packet path would put a
+    // header carrying it: labels hash to kind-1, v4 lifts to kind-4, v6 passes.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "groups":[{"name":"tenant-a","members":["vpce-abc","10.1.0.0/16","203.0.113.7","fd00:dead:beef:9::/64","2001:db8::1"]}],
+            "allow":["@tenant-a"]}"#,
+    )
+    .unwrap();
+    // kind-4 lift: 10.1.0.0/16 -> fd..:4::a01:0/112, and the /128 for the bare v4.
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:4::a01:11c")));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:4::a02:11c")));
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:4::cb00:7107")));
+    // v6 passthrough, cidr and /128.
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:9::42")));
+    assert!(c.permits_unscoped(ip("2001:db8::1")));
+    assert!(!c.permits_unscoped(ip("2001:db8::2")));
+    // kind-1: the label's hash space admits any client v4 in the low 32 bits.
+    let hashed = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","allow":["vpce-abc"]}"#,
+    )
+    .unwrap();
+    assert_eq!(hashed.allow.len(), 1);
+}
+
+#[test]
+fn anything_that_is_not_a_valid_address_is_a_label() {
+    // Total, like the wire: the packet side hashes vpce bytes verbatim, so the
+    // config side hashes whatever fails to parse -- bad widths and octets included.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","allow":["10.0.0.1/99","10.999.2.0","fd00::1/129","your-mama"]}"#,
+    )
+    .unwrap();
+    assert_eq!(c.allow.len(), 4); // four distinct hashes, nothing rejected, nothing merged
+}
+
+#[test]
+fn labels_and_v4_need_a_ula_to_encode() {
+    // Without a prefix there is no address space to land them in. Pure-v6
+    // configs stay legal without one.
+    assert!(config::parse(r#"{"scopes":[{"sni":["a.test"],"allow":["vpce-abc"]}]}"#).is_err());
+    assert!(config::parse(r#"{"scopes":[{"sni":["a.test"],"allow":["10.0.0.0/8"]}]}"#).is_err());
+    assert!(config::parse(r#"{"scopes":[{"sni":["a.test"],"allow":["fd00:dead:beef:1::/64"]}]}"#).is_ok());
+}
+
+#[test]
+fn an_auth_scope_may_carry_labels_when_the_config_has_a_ula() {
+    // The TLS chain's whole point: tenant scopes naming raw sources.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "groups":[{"name":"tenant-a","members":["vpce-abc"]}],
+            "scopes":[{"sni":["l7.mgmt.test"],"allow":["@tenant-a","10.1.0.0/16"]}]}"#,
+    )
+    .unwrap();
+    assert!(ppv2_auth::validate_auth(&c).is_ok());
+    assert!(c.permits(b"l7.mgmt.test", ip("fd00:dead:beef:4::a01:1")));
+}
+
+#[test]
+fn a_member_needing_encoding_fails_at_parse_even_in_an_unreferenced_group() {
+    // The one refusal left is a label or v4 with no `ula` to encode into, and it
+    // is checked eagerly -- otherwise it hides until some later tenant append
+    // references the group, and breaks that config instead of this one.
+    assert!(config::parse(r#"{"groups":[{"name":"stale","members":["vpce-abc"]}],"scopes":[]}"#).is_err());
+    assert!(config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","groups":[{"name":"stale","members":["vpce-abc"]}]}"#
+    )
+    .is_ok());
 }

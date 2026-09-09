@@ -219,3 +219,48 @@ pub fn parse_prefix(text: &str) -> Result<Prefix, &'static str> {
     p.copy_from_slice(&o[..6]);
     Ok(p)
 }
+
+/// Config-time twin of `synthesize`: encode one authored source exactly the way
+/// the packet path encodes a header carrying it, so the two meet by construction.
+///
+///   ipv6_cidr -> itself        ipv6 -> /128
+///   ipv4[/N]  -> kind-4 lift, /(96+N)
+///   label     -> kind-1 hash of the whole string, /96 (covers any client v4 in the low 32)
+///
+/// TOTAL over strings, like the wire: a label is anything that is not a valid
+/// address -- "10.0.0.1/99", "10.999.2.0", "fd00::1/129" included -- because the
+/// packet side hashes the vpce bytes verbatim and this must land on the same
+/// address. The one refusal is a label or v4 with no `prefix` to encode into.
+pub fn encode_member(prefix: Option<&Prefix>, member: &str) -> Result<String, String> {
+    let (addr_text, width) = match member.split_once('/') {
+        Some((a, w)) => (a, Some(w)),
+        None => (member, None),
+    };
+    // Absent defaults to max; invalid returns None, demoting the member to a label.
+    let bits = |max: u8| -> Option<u8> {
+        match width {
+            None => Some(max),
+            Some(w) => w.parse::<u8>().ok().filter(|b| *b <= max),
+        }
+    };
+    let need_prefix = || -> Result<&Prefix, String> {
+        prefix.ok_or_else(|| format!("{member:?} needs `ula` to encode"))
+    };
+
+    if let (Ok(v4), Some(b)) = (addr_text.parse::<Ipv4Addr>(), bits(32)) {
+        let mut out = [0u8; 16];
+        out[..6].copy_from_slice(need_prefix()?);
+        out[6..8].copy_from_slice(&KIND_ADDR.to_be_bytes());
+        out[12..16].copy_from_slice(&v4.octets());
+        return Ok(std::format!("{}/{}", format(out).as_str(), 96 + b as u32));
+    }
+    if let (Ok(v6), Some(b)) = (addr_text.parse::<Ipv6Addr>(), bits(128)) {
+        return Ok(std::format!("{v6}/{b}"));
+    }
+    let digest = Sha256::digest(member.as_bytes());
+    let mut out = [0u8; 16];
+    out[..6].copy_from_slice(need_prefix()?);
+    out[6..8].copy_from_slice(&KIND_VPCE.to_be_bytes());
+    out[8..12].copy_from_slice(&digest[..4]);
+    Ok(std::format!("{}/96", format(out).as_str()))
+}

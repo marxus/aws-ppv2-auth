@@ -268,3 +268,33 @@ fn to_u128_round_trips_the_wire_order() {
     let n = identity::to_u128(a);
     assert_eq!(n.to_be_bytes(), a);
 }
+
+// --- config-time encoding meets packet-time synthesis ------------------------
+
+#[test]
+fn an_encoded_member_covers_what_the_wire_synthesizes() {
+    // THE invariant behind `groups`: authoring "vpce-abc" or "10.1.0.0/16" in an
+    // allow list admits exactly the connections whose headers synthesize there.
+    let scheme = plain();
+    let covers = |member: &str, h: &ppv2::Header| {
+        let entry = identity::encode_member(Some(&TEST_PREFIX), member).unwrap();
+        let set = cidr::build(&entry).unwrap();
+        set.contains(identity::to_u128(synthesize(&scheme, h)))
+    };
+
+    // A label admits any machine behind it, whatever v4 the header carries.
+    assert!(covers("vpce-abc", &hdr_v4(b"vpce-abc", [10, 0, 1, 28])));
+    assert!(covers("vpce-abc", &hdr_v4(b"vpce-abc", [192, 168, 0, 1])));
+    assert!(!covers("vpce-abc", &hdr_v4(b"vpce-other", [10, 0, 1, 28])));
+
+    // A v4 prefix admits the NAT range, bare v4 admits one machine.
+    assert!(covers("10.1.0.0/16", &hdr_v4(b"", [10, 1, 200, 9])));
+    assert!(!covers("10.1.0.0/16", &hdr_v4(b"", [10, 2, 0, 1])));
+    assert!(covers("203.0.113.7", &hdr_v4(b"", [203, 0, 113, 7])));
+    assert!(!covers("203.0.113.7", &hdr_v4(b"", [203, 0, 113, 8])));
+
+    // v6 passthrough, both widths.
+    assert!(covers("2001:db8::/64", &hdr_v6(b"", "2001:db8::17")));
+    assert!(covers("2001:db8::17", &hdr_v6(b"", "2001:db8::17")));
+    assert!(!covers("2001:db8::17", &hdr_v6(b"", "2001:db8::18")));
+}

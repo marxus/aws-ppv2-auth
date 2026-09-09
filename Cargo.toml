@@ -1,6 +1,10 @@
+[workspace]
+# The root package (the envoy .so) plus the identity-graph aggregator binary. Two crates so kube-rs / tokio deps stay out of the module's build. Root is implicit workspace member.
+members = ["crates/agg"]
+
 [package]
 name = "ppv2-auth"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Envoy dynamic module: AWS PROXY protocol v2 identity as a matchable IPv6 address"

@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 pub mod cidr;
 pub mod config;
+pub mod graph;
 pub mod identity;
 pub mod ppv2;
 pub mod stats;
@@ -133,9 +134,11 @@ pub fn validate_ppv2_auth(cfg: &config::Config) -> Result<(), &'static str> {
 }
 
 /// `auth` reads the label a preceding `ppv2` filter left, and scopes it by SNI.
+/// A `ula` is legal here -- labels and v4 members need it to ENCODE -- but
+/// `sites` are not: they describe header parsing, which `auth` never does.
 pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.scheme.is_some() {
-        return Err("`auth` reads the label `ppv2` left, so it takes no `ula`; use `ppv2_auth`");
+    if cfg.scheme.as_ref().is_some_and(|s| !s.sites.is_empty()) {
+        return Err("`auth` reads the label `ppv2` left; `sites` belong on the filter that parses the header");
     }
     if cfg.scopes.is_none() {
         return Err("`auth` needs `scopes`");

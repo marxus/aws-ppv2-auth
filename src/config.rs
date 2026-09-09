@@ -17,6 +17,12 @@
 //! A scope may name several hostnames sharing one list -- the shape Envoy's
 //! ServerNameMatcher uses, where one `domains` list maps to one action.
 //!
+//! `allow` entries (flat or scoped) may be `@group` references into `groups`, a
+//! list of named source bags that may themselves nest via `@refs` -- see graph.rs
+//! for the walk rules and identity::encode_member for how each source becomes a
+//! CIDR. Expansion happens at parse; the running filter holds plain cidr::Sets
+//! and the packet path is unchanged.
+//!
 //! Each filter_name takes exactly one shape -- see the validators in lib.rs:
 //! `ppv2` and `ppv2_auth` take `ula` (they parse the header themselves, before
 //! tls_inspector), `auth` takes `scopes` (it runs after, reading the label a
@@ -28,13 +34,15 @@
 //! says what happens, and a flag derived from config contents would make the safe
 //! state mean allow-any.
 
-use crate::{cidr, identity};
+use crate::{cidr, graph, identity};
 use serde::Deserialize;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug)]
 pub struct Config {
-    /// Present iff this filter parses PPv2 itself; `auth` has none and reads the label.
+    /// Present iff the config carries `ula`. The header-parsing filters need it to
+    /// synthesize; `auth` may carry one purely so its members can encode, and its
+    /// filter path never reads this.
     pub scheme: Option<identity::Scheme>,
     /// Used when `scopes` is absent.
     pub allow: cidr::Set,
@@ -140,6 +148,22 @@ struct Raw {
     #[serde(default)]
     allow: Vec<String>,
     scopes: Option<Vec<RawScope>>,
+    /// Named source bags for `@refs` in `allow` and `scopes[].allow`. A member is
+    /// any source (encode_member's grammar) or `@other-group`; expansion happens
+    /// here at parse, so the running filter still holds plain cidr::Sets. May sit
+    /// unreferenced -- that is the appendable base state, same as an empty
+    /// `scopes`. A LIST OF OBJECTS like `sites`, and for the same reason: CEL can
+    /// build a list from a comprehension but not a map.
+    #[serde(default)]
+    groups: Vec<RawGroup>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGroup {
+    name: String,
+    #[serde(default)]
+    members: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -159,8 +183,21 @@ struct RawScope {
     allow: Vec<String>,
 }
 
-fn build(list: &[String]) -> Result<cidr::Set, String> {
-    cidr::build_from(list.iter().map(|s| s.as_str())).map_err(str::to_string)
+/// `@refs` expand through the graph first (unknown refs contribute nothing --
+/// see graph.rs); every literal that comes out is then encoded the way the
+/// packet path encodes a header carrying it (identity::encode_member), so an
+/// allow entry and the wire meet on the same address by construction.
+fn build(
+    list: &[String],
+    groups: &graph::Graph,
+    prefix: Option<&identity::Prefix>,
+) -> Result<cidr::Set, String> {
+    let encoded = groups
+        .resolve(list)
+        .into_iter()
+        .map(|m| identity::encode_member(prefix, m))
+        .collect::<Result<Vec<_>, String>>()?;
+    cidr::build_from(encoded.iter().map(String::as_str)).map_err(str::to_string)
 }
 
 /// A site member is a vpce-id or a source prefix, told apart the way the CRs do it:
@@ -227,7 +264,9 @@ fn build_sites(raw: Vec<RawSite>) -> Result<Vec<identity::Site>, String> {
             Ok(identity::Site {
                 id: site.id,
                 vpce,
-                cidrs: build(&prefixes)?,
+                // No graph here: site members are classifier inputs, not allowlists, and `@x` classifies as a vpce-id long before this.
+                cidrs: cidr::build_from(prefixes.iter().map(|s| s.as_str()))
+                    .map_err(str::to_string)?,
             })
         })
         .collect()
@@ -236,11 +275,16 @@ fn build_sites(raw: Vec<RawSite>) -> Result<Vec<identity::Site>, String> {
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: Raw = serde_json::from_str(text).map_err(|e| e.to_string())?;
 
-    // `via` and `sites` belong to whoever owns `ula`: they only matter to a filter
-    // that parses the header itself, and the validators enforce that.
-    let scheme = match &raw.ula {
-        Some(u) => Some(identity::Scheme {
-            prefix: identity::parse_prefix(u).map_err(str::to_string)?,
+    // The prefix serves two masters: packet-time synthesis (scheme) and
+    // config-time member encoding (build). `auth` may carry a `ula` for the
+    // second alone -- its filter path never reads scheme.
+    let prefix = match &raw.ula {
+        Some(u) => Some(identity::parse_prefix(u).map_err(str::to_string)?),
+        None => None,
+    };
+    let scheme = match prefix {
+        Some(p) => Some(identity::Scheme {
+            prefix: p,
             sites: build_sites(raw.sites)?,
         }),
         None => {
@@ -250,7 +294,20 @@ pub fn parse(text: &str) -> Result<Config, String> {
             None
         }
     };
-    let allow = build(&raw.allow)?;
+    // Literals are encoded NOW, referenced or not -- otherwise a bad member hides
+    // in an unreferenced group until some later tenant append references it, and
+    // fails THAT config. The graph itself accepts any shape; see graph.rs, and a
+    // name appearing twice is last-wins, upsert semantics.
+    let mut groups = graph::Graph::default();
+    for g in raw.groups {
+        for m in g.members.iter().filter(|m| !m.starts_with('@')) {
+            identity::encode_member(prefix.as_ref(), m)
+                .map_err(|e| format!("group {:?}: {e}", g.name))?;
+        }
+        groups.upsert(g.name, g.members);
+    }
+
+    let allow = build(&raw.allow, &groups, prefix.as_ref())?;
     let scopes = match raw.scopes {
         None => None,
         Some(list) => Some(
@@ -258,7 +315,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 .map(|s| {
                     Ok(Scope {
                         names: s.sni.iter().map(|n| Pattern::parse(n)).collect(),
-                        allow: build(&s.allow)?,
+                        allow: build(&s.allow, &groups, prefix.as_ref())?,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
