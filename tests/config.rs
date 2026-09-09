@@ -298,9 +298,9 @@ fn duplicate_names_take_the_first_scope() {
 fn sites_take_endpoint_ids_and_prefixes_of_either_family() {
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
-             "sites":[{"id":1,"members":["vpce-028ff61de1d1fea8c","3.126.239.93/32"]},
-                       {"id":2,"members":["203.0.113.0/24","2001:db8::/32"]},
-                       {"id":3,"members":["vpce-0aaa","vpce-0bbb"]}]}"#,
+             "sites":{"1":["vpce-028ff61de1d1fea8c","3.126.239.93/32"],
+                      "2":["203.0.113.0/24","2001:db8::/32"],
+                      "3":["vpce-0aaa","vpce-0bbb"]}}"#,
     )
     .unwrap();
     let s = c.scheme.as_ref().unwrap();
@@ -327,7 +327,7 @@ fn sites_take_endpoint_ids_and_prefixes_of_either_family() {
 fn a_bare_site_address_is_a_single_host() {
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
-             "sites":[{"id":5,"members":["198.51.100.7"]}]}"#,
+             "sites":{"5":["198.51.100.7"]}}"#,
     )
     .unwrap();
     let s = &c.scheme.as_ref().unwrap().sites[0];
@@ -340,11 +340,11 @@ fn a_malformed_site_fails_the_config() {
     // Same rule as the allowlist: a typo must fail rather than silently shrink
     // the table, which would quietly demote a tenant to the fallback ULA.
     for bad in [
-        r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":"nope","members":["vpce-a"]}]}"#,
-        r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":0,"members":["vpce-a"]}]}"#,
-        r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":70000,"members":["vpce-a"]}]}"#,
-        r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":1,"members":["10.0.0.0/40"]}]}"#,
-        r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":1,"members":["10.0.0.0/x"]}]}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"nope":["vpce-a"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"0":["vpce-a"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"70000":["vpce-a"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["10.0.0.0/40"]}}"#,
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["10.0.0.0/x"]}}"#,
     ] {
         assert!(config::parse(bad).is_err(), "accepted {bad}");
     }
@@ -354,36 +354,46 @@ fn a_malformed_site_fails_the_config() {
 fn sites_need_a_ula() {
     // They describe how a header is encoded, and only a filter that parses the
     // header does that -- so on `auth`, which has no `ula`, they are dead config.
-    assert!(config::parse(r#"{"sites":[{"id":1,"members":["vpce-a"]}]}"#).is_err());
+    assert!(config::parse(r#"{"sites":{"1":["vpce-a"]}}"#).is_err());
     assert!(
-        config::parse(r#"{"scopes":[{"sni":["x"]}],"sites":[{"id":1,"members":["vpce-a"]}]}"#)
+        config::parse(r#"{"scopes":[{"sni":["x"]}],"sites":{"1":["vpce-a"]}}"#)
             .is_err()
     );
 }
 
 #[test]
-fn the_filters_that_encode_are_the_ones_that_take_sites() {
-    let sited = r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":1,"members":["vpce-a"]}]}"#;
-    // Both header-parsing filters accept it.
+fn every_filter_takes_sites_because_every_filter_encodes() {
+    let sited = r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["vpce-a"]}}"#;
+    // The header-parsing filters classify against them per connection.
     assert!(validate_ppv2(&config::parse(sited).unwrap()).is_ok());
     assert!(validate_ppv2_auth(&config::parse(sited).unwrap()).is_ok());
-    // `auth` cannot express it at all: `sites` needs `ula`, and `auth` with a
-    // `ula` is rejected in turn -- so no config exists where `auth` sees a site.
+    // `auth` never parses a header, but its members encode against the same table
+    // -- a site-owned source in a scope must land in site space like the wire does.
+    let auth_sited = r#"{"ula":"fd00:dead:beef::/48",
+        "sites":{"1":["vpce-a"]},
+        "scopes":[{"sni":["x.test"],"allow":["vpce-a"]}]}"#;
+    let c = config::parse(auth_sited).unwrap();
+    assert!(validate_auth(&c).is_ok());
+    // The scope admits site 1's space, not vpce-a's hash.
+    assert!(c.permits(b"x.test", ip("fd00:dead:beef:b1a:0:1::5")));
+    // Still parse-gated on `ula`:
     assert!(
-        config::parse(r#"{"scopes":[{"sni":["x"]}],"sites":[{"id":1,"members":["vpce-a"]}]}"#)
+        config::parse(r#"{"scopes":[{"sni":["x"]}],"sites":{"1":["vpce-a"]}}"#)
             .is_err()
     );
-    assert!(validate_auth(&config::parse(sited).unwrap()).is_err());
 }
 
 #[test]
-fn one_id_cannot_appear_twice() {
-    // A list can say the same id twice where a map could not, so which members
-    // apply would depend on order. Refuse instead.
-    assert!(config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","sites":[{"id":1,"members":["vpce-a"]},{"id":1,"members":["vpce-b"]}]}"#
+fn a_map_cannot_say_one_id_twice() {
+    // The list shape could, and had to refuse it; a JSON map key is unique by
+    // construction (serde keeps the last), so the failure mode is gone.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["vpce-a"],"01":["vpce-b"]}}"#,
     )
-    .is_err());
+    .unwrap();
+    // "01" parses to the same id -- both survive as table entries with id 1, and
+    // lowest-id-wins ordering keeps lookups deterministic anyway.
+    assert_eq!(c.scheme.as_ref().unwrap().sites.len(), 2);
 }
 
 // --- groups and @refs --------------------------------------------------------
@@ -420,16 +430,20 @@ fn groups_nest_and_a_diamond_resolves_once() {
 }
 
 #[test]
-fn an_unknown_group_ref_contributes_nothing() {
-    // Deny-safe, and deliberately not an error: with watch-fed groups a ref can
-    // exist before its group does, and an ordering gap must not flap the listener.
+fn an_unknown_group_ref_is_a_label() {
+    // One mental model for everything unresolvable: it hashes, like a malformed
+    // address. Harmless -- nothing on the wire presents "@ghost" as its identity
+    // -- and when a watch-fed group appears later, the re-rendered config expands
+    // it for real. Deny-safe either way, never a listener flap.
+    // The literal sits OUTSIDE kind-1 space (fd00:dead:beef:1::/64 would swallow
+    // the hash /96 and merge into one range).
     let c = config::parse(
-        r#"{"ula":"fd00:dead:beef::/48","allow":["@ghost","fd00:dead:beef:1::/64"]}"#,
+        r#"{"ula":"fd00:dead:beef::/48","allow":["@ghost","fd00:dead:beef:9::/64"]}"#,
     )
     .unwrap();
-    assert_eq!(c.allow.len(), 1);
-    assert!(c.permits_unscoped(ip(TENANT)));
-    assert!(!c.permits_unscoped(ip(OTHER)));
+    assert_eq!(c.allow.len(), 2); // the literal, plus @ghost's kind-1 hash space
+    assert!(c.permits_unscoped(ip(OTHER)));
+    assert!(!c.permits_unscoped(ip(TENANT)));
 }
 
 #[test]
@@ -545,4 +559,72 @@ fn a_member_needing_encoding_fails_at_parse_even_in_an_unreferenced_group() {
         r#"{"ula":"fd00:dead:beef::/48","groups":{"stale":["vpce-abc"]}}"#
     )
     .is_ok());
+}
+
+// --- sites in the source grammar ---------------------------------------------
+
+#[test]
+fn a_site_ref_encodes_the_whole_site_space() {
+    // "!1" is config-only syntax: the declared site's /96, sources or not.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["vpce-a"],"7":[]},"allow":["!1","!7"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:1:a01:1")));
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:7::")));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:2::")));
+    // Unresolvable site refs are labels, exactly like "@ghost": bad syntax ("!x",
+    // "!0") and an id no site declares ("!5"). A site declared later re-renders
+    // the config and the ref resolves then.
+    let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["!x","!0","!5"]}"#).unwrap();
+    assert_eq!(c.allow.len(), 3); // three hashes, no site space
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a::")));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:5::")));
+}
+
+#[test]
+fn a_site_owned_source_encodes_as_the_site_not_itself() {
+    // The wire labels these connections with the site space (site_of runs first),
+    // so the config must land there too -- a raw vpce or a contained range in an
+    // allow list admits the SITE, exactly like writing "!1".
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "sites":{"1":["vpce-abc","10.1.0.0/16"]},
+            "allow":["vpce-abc","10.1.2.0/24"]}"#,
+    )
+    .unwrap();
+    // Both entries collapsed into site 1's /96.
+    assert_eq!(c.allow.len(), 1);
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:1:a01:11c")));
+    // And NOT the hash/lift they would otherwise become.
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:4::a01:200")));
+}
+
+#[test]
+fn a_range_only_partly_inside_a_site_stays_a_lift() {
+    // Containment is whole-range: a member straddling the site boundary cannot
+    // honestly encode as either kind, so it falls through to the ordinary lift.
+    // Split the range or use !N.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "sites":{"1":["10.1.128.0/17"]},
+            "allow":["10.1.0.0/16"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:4::a01:1")));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:1::")));
+}
+
+#[test]
+fn a_source_two_sites_claim_goes_to_the_lower_id() {
+    // One tiebreak, applied identically at packet time and config time: sites are
+    // sorted by id at load, first match wins.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48",
+            "sites":{"9":["vpce-shared"],"3":["vpce-shared"]},
+            "allow":["vpce-shared"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:3::")));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:9::")));
 }

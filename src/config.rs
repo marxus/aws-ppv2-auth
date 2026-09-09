@@ -138,14 +138,13 @@ impl Config {
 #[serde(deny_unknown_fields)]
 struct Raw {
     ula: Option<String>,
-    /// The tenant table: an id, and the vpce-ids and source prefixes that resolve to it.
-    ///
-    /// A LIST OF OBJECTS, not a map keyed by id, and that is a constraint from the
-    /// generator rather than a preference: CEL can build a list from a
-    /// comprehension but not a map, so a ConfigMap of id -> text can be reshaped
-    /// into this and not into the other.
+    /// The tenant table, keyed by site id: the vpce-ids and source prefixes that
+    /// resolve to each. A map like `groups`, and buildable the same way -- CEL's
+    /// transformMapEntry folds a CR collection into this shape. JSON keys are
+    /// strings, so the id parses here; a key that is not 1-65535 fails the config
+    /// (this is structure, not wire data -- no label fallback for table keys).
     #[serde(default)]
-    sites: Vec<RawSite>,
+    sites: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     allow: Vec<String>,
     scopes: Option<Vec<RawScope>>,
@@ -162,14 +161,6 @@ struct Raw {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawSite {
-    id: u16,
-    #[serde(default)]
-    members: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawScope {
     #[serde(default)]
     sni: Vec<String>,
@@ -177,19 +168,19 @@ struct RawScope {
     allow: Vec<String>,
 }
 
-/// `@refs` expand through the graph first (unknown refs contribute nothing --
-/// see graph.rs); every literal that comes out is then encoded the way the
-/// packet path encodes a header carrying it (identity::encode_member), so an
+/// `@refs` expand through the graph first (an unknown ref falls through as a
+/// label -- see graph.rs); every literal that comes out is then encoded the way
+/// the packet path encodes a header carrying it (identity::encode_member), so an
 /// allow entry and the wire meet on the same address by construction.
 fn build(
     list: &[String],
     groups: &graph::Graph,
-    prefix: Option<&identity::Prefix>,
+    scheme: Option<&identity::Scheme>,
 ) -> Result<cidr::Set, String> {
     let encoded = groups
         .resolve(list)
         .into_iter()
-        .map(|m| identity::encode_member(prefix, m))
+        .map(|m| identity::encode_member(scheme, m))
         .collect::<Result<Vec<_>, String>>()?;
     cidr::build_from(encoded.iter().map(String::as_str)).map_err(str::to_string)
 }
@@ -225,45 +216,44 @@ fn classify(member: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-fn build_sites(raw: Vec<RawSite>) -> Result<Vec<identity::Site>, String> {
-    let mut seen: Vec<u16> = Vec::new();
-    raw.into_iter()
-        .map(|site| {
+fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>, String> {
+    let mut sites = raw
+        .into_iter()
+        .map(|(key, sources)| {
             // 0 is not reserved for anything, but tailscale renders it as the bare
             // prefix, which reads as "no site" -- so refuse it rather than emit it.
-            if site.id == 0 {
-                return Err("site 0 is not usable: it renders as the bare via prefix".to_string());
-            }
-            // Two entries for one id would make which members apply depend on order.
-            if seen.contains(&site.id) {
-                return Err(format!("site {} appears twice", site.id));
-            }
-            seen.push(site.id);
+            let id = key
+                .parse::<u16>()
+                .ok()
+                .filter(|id| *id != 0)
+                .ok_or_else(|| format!("site key {key:?} is not 1-65535"))?;
 
             let mut vpce = Vec::new();
             let mut prefixes = Vec::new();
-            // Trimmed and empties dropped: the generator splits a text block, so a
-            // trailing newline would otherwise become a member named "".
-            for m in site
-                .members
-                .iter()
-                .map(|m| m.trim())
-                .filter(|m| !m.is_empty())
-            {
+            // Trimmed and empties dropped: a generator splitting a text block would
+            // otherwise turn a trailing newline into a source named "".
+            for m in sources.iter().map(|m| m.trim()).filter(|m| !m.is_empty()) {
+                // Sources, not members: classifier inputs only. `@refs` are not
+                // followed -- an @-string is an opaque byte pattern here.
                 match classify(m)? {
                     Some(cidr_text) => prefixes.push(cidr_text),
                     None => vpce.push(m.as_bytes().to_vec().into_boxed_slice()),
                 }
             }
             Ok(identity::Site {
-                id: site.id,
+                id,
                 vpce,
-                // No graph here: site members are classifier inputs, not allowlists, and `@x` classifies as a vpce-id long before this.
                 cidrs: cidr::build_from(prefixes.iter().map(|s| s.as_str()))
                     .map_err(str::to_string)?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    // Sorted NUMERICALLY (the map iterates its string keys lexically: "10" < "2")
+    // so first-match iteration is lowest-id-wins -- the one tiebreak for a source
+    // two sites claim, applied identically at packet time (site_of) and config
+    // time (encode_member), so the two can never disagree.
+    sites.sort_unstable_by_key(|s| s.id);
+    Ok(sites)
 }
 
 pub fn parse(text: &str) -> Result<Config, String> {
@@ -294,13 +284,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let mut groups = graph::Graph::default();
     for (name, members) in raw.groups {
         for m in members.iter().filter(|m| !m.starts_with('@')) {
-            identity::encode_member(prefix.as_ref(), m)
+            identity::encode_member(scheme.as_ref(), m)
                 .map_err(|e| format!("group {name:?}: {e}"))?;
         }
         groups.upsert(name, members);
     }
 
-    let allow = build(&raw.allow, &groups, prefix.as_ref())?;
+    let allow = build(&raw.allow, &groups, scheme.as_ref())?;
     let scopes = match raw.scopes {
         None => None,
         Some(list) => Some(
@@ -308,7 +298,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 .map(|s| {
                     Ok(Scope {
                         names: s.sni.iter().map(|n| Pattern::parse(n)).collect(),
-                        allow: build(&s.allow, &groups, prefix.as_ref())?,
+                        allow: build(&s.allow, &groups, scheme.as_ref())?,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,

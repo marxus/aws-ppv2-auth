@@ -30,6 +30,17 @@ impl Set {
         i > 0 && addr <= self.ranges[i - 1].end
     }
 
+    /// Whole-range containment: disjoint + merged, so [start, end] is covered iff
+    /// ONE range covers both ends. A range straddling two of ours is NOT contained
+    /// -- the gap between them is real.
+    pub fn contains_range(&self, start: u128, end: u128) -> bool {
+        if start < self.span.0 || end > self.span.1 {
+            return false;
+        }
+        let i = self.ranges.partition_point(|r| r.start <= start);
+        i > 0 && end <= self.ranges[i - 1].end
+    }
+
     pub fn len(&self) -> usize {
         self.ranges.len()
     }

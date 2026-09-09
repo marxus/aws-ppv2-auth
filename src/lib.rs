@@ -134,12 +134,10 @@ pub fn validate_ppv2_auth(cfg: &config::Config) -> Result<(), &'static str> {
 }
 
 /// `auth` reads the label a preceding `ppv2` filter left, and scopes it by SNI.
-/// A `ula` is legal here -- labels and v4 members need it to ENCODE -- but
-/// `sites` are not: they describe header parsing, which `auth` never does.
+/// A `ula` AND `sites` are legal here -- members need both to ENCODE the way the
+/// wire does (site-owned sources land in site space); its filter path never
+/// parses a header, so neither is consulted per connection.
 pub fn validate_auth(cfg: &config::Config) -> Result<(), &'static str> {
-    if cfg.scheme.as_ref().is_some_and(|s| !s.sites.is_empty()) {
-        return Err("`auth` reads the label `ppv2` left; `sites` belong on the filter that parses the header");
-    }
     if cfg.scopes.is_none() {
         return Err("`auth` needs `scopes`");
     }

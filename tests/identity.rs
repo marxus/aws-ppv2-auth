@@ -277,7 +277,7 @@ fn an_encoded_member_covers_what_the_wire_synthesizes() {
     // allow list admits exactly the connections whose headers synthesize there.
     let scheme = plain();
     let covers = |member: &str, h: &ppv2::Header| {
-        let entry = identity::encode_member(Some(&TEST_PREFIX), member).unwrap();
+        let entry = identity::encode_member(Some(&scheme), member).unwrap();
         let set = cidr::build(&entry).unwrap();
         set.contains(identity::to_u128(synthesize(&scheme, h)))
     };
@@ -297,4 +297,26 @@ fn an_encoded_member_covers_what_the_wire_synthesizes() {
     assert!(covers("2001:db8::/64", &hdr_v6(b"", "2001:db8::17")));
     assert!(covers("2001:db8::17", &hdr_v6(b"", "2001:db8::17")));
     assert!(!covers("2001:db8::17", &hdr_v6(b"", "2001:db8::18")));
+}
+
+#[test]
+fn a_site_owned_source_and_the_wire_meet_in_site_space() {
+    // The site-table branch of the config/wire invariant: whatever names a site's
+    // traffic in an allow list -- !N, the raw vpce, a contained range -- covers
+    // exactly the connections whose headers synthesize into that site.
+    let scheme = with_sites(); // site 7 by vpce, site 2 by 203.0.113.0/120-mapped prefix
+    let covers = |member: &str, h: &ppv2::Header| {
+        let entry = identity::encode_member(Some(&scheme), member).unwrap();
+        let set = cidr::build(&entry).unwrap();
+        set.contains(identity::to_u128(synthesize(&scheme, h)))
+    };
+
+    let vpce = b"vpce-0123456789abcdef0";
+    assert!(covers("!7", &hdr_v4(vpce, [10, 0, 1, 28])));
+    assert!(covers("vpce-0123456789abcdef0", &hdr_v4(vpce, [10, 0, 1, 28])));
+    assert!(!covers("!7", &hdr_v4(b"vpce-other", [10, 0, 1, 28])));
+
+    assert!(covers("!2", &hdr_v4(b"", [203, 0, 113, 9])));
+    assert!(covers("203.0.113.0/24", &hdr_v4(b"", [203, 0, 113, 9])));
+    assert!(!covers("!2", &hdr_v4(b"", [203, 0, 114, 9])));
 }

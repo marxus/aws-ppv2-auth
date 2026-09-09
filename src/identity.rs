@@ -222,16 +222,40 @@ pub fn parse_prefix(text: &str) -> Result<Prefix, &'static str> {
 
 /// Config-time twin of `synthesize`: encode one authored source exactly the way
 /// the packet path encodes a header carrying it, so the two meet by construction.
+/// Site table first, mirroring site_of:
 ///
-///   ipv6_cidr -> itself        ipv6 -> /128
-///   ipv4[/N]  -> kind-4 lift, /(96+N)
-///   label     -> kind-1 hash of the whole string, /96 (covers any client v4 in the low 32)
+///   !N          -> site N's space, /96 (whatever its sources are, even none yet)
+///   site-owned  -> that site's space, /96 -- a label a site lists, or an address
+///                  range CONTAINED in a site's cidrs (lowest id wins; partial
+///                  overlap does not count, split the range or use !N)
+///   ipv6_cidr   -> itself          ipv6 -> /128
+///   ipv4[/N]    -> kind-4 lift, /(96+N)
+///   label       -> kind-1 hash of the whole string, /96
 ///
 /// TOTAL over strings, like the wire: a label is anything that is not a valid
-/// address -- "10.0.0.1/99", "10.999.2.0", "fd00::1/129" included -- because the
-/// packet side hashes the vpce bytes verbatim and this must land on the same
-/// address. The one refusal is a label or v4 with no `prefix` to encode into.
-pub fn encode_member(prefix: Option<&Prefix>, member: &str) -> Result<String, String> {
+/// address or a valid !site -- "10.0.0.1/99", "!x", "fd00::1/129" included --
+/// because the packet side hashes the vpce bytes verbatim and this must land on
+/// the same address. The one refusal is a source with no `scheme` to encode into.
+pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, String> {
+    let need = || -> Result<&Scheme, String> {
+        scheme.ok_or_else(|| format!("{member:?} needs `ula` to encode"))
+    };
+
+    // A site ref resolves only against a DECLARED site -- "!5" with no site 5 is
+    // an unresolvable ref, and everything unresolvable is a label, same as
+    // "@ghost". A site declared later (watch-fed) re-renders the config and the
+    // ref resolves then.
+    if let Some(id) = member
+        .strip_prefix('!')
+        .and_then(|t| t.parse::<u16>().ok())
+        .filter(|id| *id != 0)
+    {
+        let sch = need()?;
+        if sch.sites.iter().any(|s| s.id == id) {
+            return Ok(site_space(&sch.prefix, id));
+        }
+    }
+
     let (addr_text, width) = match member.split_once('/') {
         Some((a, w)) => (a, Some(w)),
         None => (member, None),
@@ -243,24 +267,75 @@ pub fn encode_member(prefix: Option<&Prefix>, member: &str) -> Result<String, St
             Some(w) => w.parse::<u8>().ok().filter(|b| *b <= max),
         }
     };
-    let need_prefix = || -> Result<&Prefix, String> {
-        prefix.ok_or_else(|| format!("{member:?} needs `ula` to encode"))
-    };
 
     if let (Ok(v4), Some(b)) = (addr_text.parse::<Ipv4Addr>(), bits(32)) {
+        let sch = need()?;
+        // Mapped form, because that is how site cidrs hold v4.
+        let base = 0xffff_0000_0000u128 | u32::from_be_bytes(v4.octets()) as u128;
+        let (start, end) = range_of(base, 96 + b);
+        if let Some(id) = site_owning_range(&sch.sites, start, end) {
+            return Ok(site_space(&sch.prefix, id));
+        }
         let mut out = [0u8; 16];
-        out[..6].copy_from_slice(need_prefix()?);
+        out[..6].copy_from_slice(&sch.prefix);
         out[6..8].copy_from_slice(&KIND_ADDR.to_be_bytes());
         out[12..16].copy_from_slice(&v4.octets());
         return Ok(std::format!("{}/{}", format(out).as_str(), 96 + b as u32));
     }
     if let (Ok(v6), Some(b)) = (addr_text.parse::<Ipv6Addr>(), bits(128)) {
+        // v6 passes through UNLESS a site claims the range -- the wire labels
+        // those connections with the site space, so the config must too.
+        if let Some(sch) = scheme {
+            let (start, end) = range_of(to_u128(v6.octets()), b);
+            if let Some(id) = site_owning_range(&sch.sites, start, end) {
+                return Ok(site_space(&sch.prefix, id));
+            }
+        }
         return Ok(std::format!("{v6}/{b}"));
+    }
+
+    let sch = need()?;
+    if let Some(id) = site_owning_label(&sch.sites, member.as_bytes()) {
+        return Ok(site_space(&sch.prefix, id));
     }
     let digest = Sha256::digest(member.as_bytes());
     let mut out = [0u8; 16];
-    out[..6].copy_from_slice(need_prefix()?);
+    out[..6].copy_from_slice(&sch.prefix);
     out[6..8].copy_from_slice(&KIND_VPCE.to_be_bytes());
     out[8..12].copy_from_slice(&digest[..4]);
     Ok(std::format!("{}/96", format(out).as_str()))
+}
+
+/// The whole tenant: kind SITE, the id in group 6, machine bits open -- /96.
+fn site_space(prefix: &Prefix, id: u16) -> String {
+    let mut out = [0u8; 16];
+    out[..6].copy_from_slice(prefix);
+    out[6..8].copy_from_slice(&KIND_SITE.to_be_bytes());
+    out[10..12].copy_from_slice(&id.to_be_bytes());
+    std::format!("{}/96", format(out).as_str())
+}
+
+/// The inclusive range a prefix covers.
+fn range_of(addr: u128, bits: u8) -> (u128, u128) {
+    if bits == 0 {
+        return (0, u128::MAX);
+    }
+    let mask: u128 = u128::MAX << (128 - bits as u32);
+    (addr & mask, (addr & mask) | !mask)
+}
+
+/// Sites arrive sorted by id (config.rs), so first match IS lowest-id-wins --
+/// the same tiebreak the packet path applies, so the two cannot disagree.
+fn site_owning_range(sites: &[Site], start: u128, end: u128) -> Option<u16> {
+    sites
+        .iter()
+        .find(|s| s.cidrs.contains_range(start, end))
+        .map(|s| s.id)
+}
+
+fn site_owning_label(sites: &[Site], label: &[u8]) -> Option<u16> {
+    sites
+        .iter()
+        .find(|s| s.vpce.iter().any(|v| &**v == label))
+        .map(|s| s.id)
 }
