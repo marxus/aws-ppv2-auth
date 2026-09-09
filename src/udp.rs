@@ -30,6 +30,26 @@ impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for TableFilter {
     }
 }
 
+/// What a rejected UDP config becomes INSTEAD of `None`: Envoy 1.39.1 segfaults
+/// on a null UDP dynamic-module config (the TCP path NACKs cleanly), so the
+/// fail-closed shape here is a filter that drops every datagram -- same denial,
+/// no crash. The rejection is still loud on stderr.
+pub struct DenyAllConfig;
+
+impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilterConfig<ELF> for DenyAllConfig {
+    fn new_udp_listener_filter(&self, _envoy: &mut ELF) -> Box<dyn UdpListenerFilter<ELF>> {
+        Box::new(DenyAllFilter)
+    }
+}
+
+struct DenyAllFilter;
+
+impl<ELF: EnvoyUdpListenerFilter> UdpListenerFilter<ELF> for DenyAllFilter {
+    fn on_data(&mut self, _envoy: &mut ELF) -> Status {
+        Status::StopIteration
+    }
+}
+
 fn bump<ELF: EnvoyUdpListenerFilter>(envoy: &ELF, id: Option<EnvoyCounterId>) {
     if let Some(id) = id {
         let _ = envoy.increment_counter(id, 1);

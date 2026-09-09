@@ -84,24 +84,27 @@ fn new_udp_listener_filter_config<EC: EnvoyUdpListenerFilterConfig, ELF: EnvoyUd
     name: &str,
     config_bytes: &[u8],
 ) -> Option<Box<dyn UdpListenerFilterConfig<ELF>>> {
-    match name {
-        "ppv2_auth" => {
-            let cfg = load(config_bytes, validate_ppv2_auth)?;
+    // NEVER None on UDP: Envoy 1.39.1 segfaults on a null UDP dynamic-module
+    // config where TCP NACKs cleanly (observed live, 0.14 -> 0.15 rollout). A
+    // rejected config becomes a drop-everything filter instead -- the same
+    // fail-closed denial, minus the crash. stderr still says why.
+    let built: Option<Box<dyn UdpListenerFilterConfig<ELF>>> = match name {
+        "ppv2_auth" => load(config_bytes, validate_ppv2_auth).map(|cfg| {
             let counters =
                 stats::Counters::register(name, |n| envoy_filter_config.define_counter(n).ok());
-            Some(Box::new(udp::Ppv2AuthConfig { cfg, counters }))
-        }
-        "table" => {
-            let cfg = load(config_bytes, validate_table)?;
+            Box::new(udp::Ppv2AuthConfig { cfg, counters }) as _
+        }),
+        "table" => load(config_bytes, validate_table).map(|cfg| {
             config::publish(cfg.table.clone());
-            Some(Box::new(udp::TableConfig))
-        }
+            Box::new(udp::TableConfig) as _
+        }),
         _ => {
             // The UDP ABI has no way to hand an identity onward, so UDP enforcement is one filter.
             eprintln!("ppv2-auth: UDP supports only filter_name ppv2_auth or table, got {name:?}");
             None
         }
-    }
+    };
+    Some(built.unwrap_or_else(|| Box::new(udp::DenyAllConfig)))
 }
 
 /// Prefixed with the filter_name: all filters share one metrics namespace, so
