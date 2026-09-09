@@ -1,3 +1,6 @@
+# Standalone on purpose (empty [workspace]): a throwaway prototype the module's build, lock and Docker image must not know about. Build from this directory.
+[workspace]
+
 [package]
 name = "identity-agg"
 version = "0.1.0"
