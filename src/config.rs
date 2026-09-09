@@ -177,11 +177,17 @@ fn build(
     groups: &graph::Graph,
     scheme: Option<&identity::Scheme>,
 ) -> Result<cidr::Set, String> {
-    let encoded = groups
-        .resolve(list)
-        .into_iter()
-        .map(|m| identity::encode_member(scheme, m))
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut encoded: Vec<String> = Vec::new();
+    for m in groups.resolve(list) {
+        // The one member that expands to MANY entries, so it lives here in the
+        // expansion rather than in encode_member's one-in-one-out grammar.
+        if m == "!*" {
+            let sch = scheme.ok_or_else(|| "\"!*\" needs `ula` to encode".to_string())?;
+            encoded.extend(identity::encode_all_sites(sch));
+        } else {
+            encoded.push(identity::encode_member(scheme, m)?);
+        }
+    }
     cidr::build_from(encoded.iter().map(String::as_str)).map_err(str::to_string)
 }
 

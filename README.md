@@ -7,9 +7,9 @@ identity at both L4 and L7.
 Three filters ship in one `.so`, chosen by `filter_name`. Each name is a position
 in a chain and takes exactly one config shape:
 
-    ppv2_auth   parse the header, synthesize, enforce      ula + allow
-    ppv2        parse the header, synthesize, label only   ula
-    auth        read that label, scope by SNI, enforce     scopes
+    ppv2_auth   parse the header, synthesize, enforce      ula + sites + groups + allow
+    ppv2        parse the header, synthesize, label only   ula + sites
+    auth        read that label, scope by SNI, enforce     scopes (+ ula/sites/groups, to encode)
 
     tcp  -> [ppv2_auth, ...]
     udp  -> [ppv2_auth, ...]
@@ -49,6 +49,7 @@ Reproduce a kind-1 hash with
 |---|---|
 | resolves to a site, by `vpce-id` | `b1a` + site + the tenant's own IPv4 |
 | resolves to a site, by source prefix | `b1a` + site, low 32 bits **zero** |
+| resolves to a **contested** source | `b1a` + site **0** — see quarantine below |
 | a `vpce-id` no site claims | kind 1, `sha256(id)` + client IPv4 |
 | no `vpce-id`, IPv4 client | kind 4, the address alone |
 | no `vpce-id`, IPv6 client | **passed through unchanged** |
@@ -102,7 +103,7 @@ ConfigMap:
 pod:
   volumes:
     - name: ppv2-auth
-      image: { reference: ghcr.io/marxus/aws-ppv2-auth:0.5.0 }
+      image: { reference: ghcr.io/marxus/aws-ppv2-auth:0.13.0 }
 container:
   volumeMounts: [{ name: ppv2-auth, mountPath: /modules, readOnly: true }]
   env: [{ name: LD_LIBRARY_PATH, value: /modules }]
@@ -132,59 +133,120 @@ filter_config:
 A scope may name **several hostnames** sharing one list — the shape Envoy's
 `ServerNameMatcher` uses, where one `domains` list maps to one action.
 
-Each filter takes one config shape, and anything else fails the listener:
+Each filter takes one shape, and anything else fails the listener:
 
 | filter | config | meaning |
 |---|---|---|
-| `ppv2_auth` | `ula` + `allow` | the whole job in one — plain TCP, and UDP |
-| `ppv2` | `ula` only | synthesize and label; it never denies, so it takes no rules |
-| `auth` | `scopes` | read the label a `ppv2` filter left — the TLS chain |
+| `ppv2_auth` | `ula` `sites` `groups` `allow` | the whole job in one — plain TCP, and UDP |
+| `ppv2` | `ula` `sites` | synthesize and label; it never denies, so it takes no rules |
+| `auth` | `scopes` + `ula` `sites` `groups` | read the label a `ppv2` filter left — the TLS chain |
 
-`sites` is optional and belongs wherever `ula` does: it describes how a header
-is encoded, and only a filter that parses the header does that. On `auth` it is
-rejected, because there it would read as applied and do nothing.
+`ula` and `sites` describe how a header is encoded, so the header-parsing filters
+need them per connection. `auth` never parses a header, but its rule entries must
+**encode the way the wire does**, so it carries the same table for that alone.
+
+### The source grammar
+
+Every entry in `allow`, `scopes[].allow`, and every group member is one grammar,
+and encoding is **total over strings** — the packet side hashes header bytes
+verbatim, so the config side never second-guesses:
+
+| entry | encodes to |
+|---|---|
+| `@group` | expand through `groups` — nested `@refs` walk, revisits skip (cycles just terminate) |
+| `!N` | declared site N's whole space, `<ula>:b1a:0:<N>::/96` |
+| `!0` | the quarantine space, `<ula>:b1a::/96` — always resolvable, system-owned |
+| `!*` | every **declared** site's space — the union, current by construction |
+| site-owned source | that site's `/96` — a label a site lists, or a range wholly inside its prefixes |
+| `ipv6` / `ipv6_cidr` | itself (`/128` for a bare address) |
+| `ipv4` / `ipv4_cidr` | kind-4 lift, `/(96+N)` |
+| anything else | kind-1 label hash of the verbatim string, `/96` |
+
+"Anything else" includes bad widths (`10.0.0.1/99`), bad octets (`10.999.2.0`),
+unknown `@ghost`, undeclared `!5` — one fallback rule, deny-safe, and a group or
+site that appears later re-renders the config and the ref resolves for real. The
+only refusal is a source that needs encoding with no `ula` to encode into.
 
 ```yaml
     ula: fd0b:1003:5ec0::/48
     sites:
-      - id: 1
-        members: [vpce-028ff61de1d1fea8c, 3.126.239.93/32]
-      - id: 2
-        members: [203.0.113.0/24, 198.51.100.7/32]
+      "1": [vpce-028ff61de1d1fea8c, 3.126.239.93]
+      "2": [203.0.113.0/24]
+    groups:
+      tenant-a: [vpce-028ff61de1d1fea8c]    # site 1 owns it -> encodes as !1
+      home:     [81.199.237.15, 2a02:ba0:10a8:3427::/64]
+      trusted:  ["@tenant-a", "@home", "!2"]
+    allow: ["@trusted"]
 ```
 
-A list of objects rather than a map keyed by id, and that is the generator's
-constraint rather than a preference: CEL can build a list from a comprehension
-but not a map, so a ConfigMap of `id -> text` can be reshaped into this shape and
-not into the other. Ids must be unique — a list can repeat one where a map could
-not, and then which members apply would depend on order.
+`sites` and `groups` are maps — CEL's `transformMapEntry` folds a CR collection
+into exactly this shape, so a Kubernetes controller can generate both (see the
+registry section). Site keys must parse to 1..=65535; id 0 is the system's.
+Groups may sit unreferenced — that is the appendable base state, same as
+`scopes: []` — and their literals are validated eagerly so a bad member cannot
+hide until some later tenant references the group.
 
-A site member is a `vpce-id` or a source prefix, told apart by trying to read it
-as an address. IPv4 is lifted to `::ffff:a.b.c.d/(96+N)` so one matcher covers
-both families, and a bare address means a single host. A `vpce-id` outranks a
-prefix: AWS assigned it and the sender cannot choose it.
+A site *source* is a `vpce-id` or a source prefix, told apart by trying to read
+it as an address; `@strings` are not followed there — sources are classifier
+inputs, and an `@` pattern is bytes no header will ever carry. IPv4 lifts to
+`::ffff:a.b.c.d/(96+N)` so one matcher covers both families. A `vpce-id` outranks
+a prefix: AWS assigned it and the sender cannot choose it.
 
-Site ids are 1..=65535 — the field is 16 bits, and 0 renders as the bare `via`
-prefix, so it is refused. Overlapping prefixes across sites are **not** detected
-here; keep them disjoint where the table is generated, or which site wins depends
-on iteration order.
+### Contested sources: site 0 is quarantine
 
-An empty or absent `sites` sends every header to kind 1 or 4, which is what this
-module did before v0.6.0.
+Site matching is two flat indices built once at load — a `vpce -> id` map and a
+disjoint segment map over every site's ranges (overlaps split at boundaries), one
+hash lookup + one binary search per connection whatever the site count. Building
+the segments is where contests surface, and **a contest resolves to site 0**
+rather than to a winner: a label two sites list, or the overlap of two sites'
+ranges, is nobody's privilege and everybody's visibility. Load prints one warning
+per contest naming the claimants.
 
-The split exists only because TLS forces it: `auth` needs the SNI, which exists
-only after `tls_inspector`, and `tls_inspector` cannot find a ClientHello until
-the PROXY header is drained. Everywhere else `ppv2_auth` does both halves.
+The quarantine space is `<ula>:b1a::/96`. Nothing admits it unless a rule says
+`!0` — the conventional group for that is `unknown-site: ["!0"]` — so contested
+traffic keeps flowing wherever examination is welcome and nowhere privileged.
+`encode_member` answers range ownership from the same segments, so a member
+spanning two owners honestly encodes as **neither** (it falls to the plain lift):
+no single encoding could match what the wire stamps.
 
-Because the name fixes the shape, a filter in the wrong place fails its listener
-rather than half-working — `ppv2_auth` with `scopes` is rejected (it runs before
-`tls_inspector`, so there is no SNI), and `auth` with a `ula` is too.
+Contests are detectable misconfiguration; the *undetectable* version — a site
+claiming a range that simply belongs to someone who never declared it — can only
+be prevented where sources are allocated. Guard the registry at provisioning
+(duplicate-label and overlap checks belong there), and treat NAT-CIDR identity as
+weaker than PrivateLink identity when writing privileged rules.
 
-An `auth` filter with no `allow` at all is valid and denies everything — an empty
-allowlist is deny-all, the same as an empty security group. There is no
+An empty or absent `sites` sends every header to kind 1 or 4. An empty `allow`
+denies everything — the same as an empty security group. There is no
 `require_ppv2` knob: this module is the first thing after the NLB, so traffic
 without a header reached the listener directly and is refused, always. Unknown
 fields fail the config, so a typo cannot silently disable enforcement.
+
+Because the name fixes the shape, a filter in the wrong place fails its listener
+rather than half-working — `ppv2_auth` with `scopes` is rejected (it runs before
+`tls_inspector`, so there is no SNI).
+
+### The registry on Kubernetes
+
+The intended authoring surface is three CRDs and zero controllers of ours:
+
+| kind | what | controller |
+|---|---|---|
+| `IdentitySite` | `spec.id` + `spec.sources` — the wire identity | none: a plain CRD, pure data |
+| `IdentityGroup` | `spec.members` — composition, `@refs`/`!refs`/sources | none: a plain CRD, pure data |
+| `PPv2Auth` / `PPv2AuthRule` | base filter chain per port / tenant allow+scopes | [kro](https://kro.run) graphs |
+
+The kro base graph `externalRef`s every `IdentitySite` and `IdentityGroup` in the
+namespace and folds them into `sites`/`groups` with
+`transformMapEntry(i, s, {string(s.spec.id): ...})` — raw, unresolved, no CEL
+identity math. All resolution is this module, one Rust codepath for config load
+and packet time, so the two can never drift. A group or site change re-renders
+the patch policy, Envoy Gateway pushes new xDS, the module re-parses: seconds,
+end to end, with no per-CR reconcile fan-out.
+
+One rule keeps it sane: **one owner mints `IdentitySite` CRs** (the tenant
+provisioning layer), because two stacks writing sites is how duplicate ids
+happen — kro's fold fails loudly on a duplicate key and freezes the policy at
+last-good, but the fix is ownership, not error handling.
 
 ### Contributing scopes from separate CRs
 
@@ -314,6 +376,10 @@ Fail-closed, but check the chain order first if a listener refuses everything.
 reach one directly can claim any address and have it adopted — the same class of
 issue as trusting `X-Forwarded-For` behind an L4 load balancer. Restrict the
 listener ports to the load balancer.
+
+**Contested sources are quarantined, not adjudicated.** The data plane can only
+be deterministic about ownership, never right — see the site-0 section. Verify
+source claims where they are provisioned.
 
 The vpce-id does not survive endpoint recreation. A replaced endpoint gets a new
 id and is then denied with no symptom but a 403 that looks like a routing

@@ -354,6 +354,8 @@ pub fn parse_prefix(text: &str) -> Result<Prefix, &'static str> {
 /// Site table first, mirroring site_of:
 ///
 ///   !N          -> site N's space, /96 (whatever its sources are, even none yet)
+///   !*          -> every DECLARED site's space -- see encode_all_sites; expansion
+///                  handles it (one member, many entries), this function never sees it
 ///   site-owned  -> that site's space, /96 -- a label a site lists, or an address
 ///                  range CONTAINED in a site's cidrs (lowest id wins; partial
 ///                  overlap does not count, split the range or use !N)
@@ -431,6 +433,18 @@ pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, St
     out[6..8].copy_from_slice(&KIND_VPCE.to_be_bytes());
     out[8..12].copy_from_slice(&digest[..4]);
     Ok(std::format!("{}/96", format(out).as_str()))
+}
+
+/// "!*": every declared site's space -- the union @known-sites would name, kept
+/// current by construction. Site 0 is absent because it cannot be declared; add
+/// "!0" alongside when quarantined traffic should pass too. Empty table = empty
+/// union: "!*" with nothing onboarded contributes nothing, deny-safe.
+pub fn encode_all_sites(scheme: &Scheme) -> Vec<String> {
+    scheme
+        .sites
+        .iter()
+        .map(|s| site_space(&scheme.prefix, s.id))
+        .collect()
 }
 
 /// The whole tenant: kind SITE, the id in group 6, machine bits open -- /96.

@@ -631,3 +631,30 @@ fn a_source_two_sites_claim_is_contested_and_goes_to_site_0() {
     assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:3::")));
     assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:9::")));
 }
+
+#[test]
+fn a_site_star_expands_to_every_declared_site() {
+    // "!*" is the grammar form of a TF-maintained @known-sites: the union of all
+    // DECLARED sites, current by construction. Site 0 is not declarable, so the
+    // quarantine space needs an explicit "!0" alongside.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":[],"2":[],"7":[]},"allow":["!*"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:1:a01:1")));
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:2::")));
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:7::")));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a::")));      // quarantine
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:5::")));  // undeclared id
+
+    // Works through groups too, and an empty table is an empty union: deny-all.
+    let c = config::parse(
+        r#"{"ula":"fd00:dead:beef::/48","sites":{"1":[]},
+            "groups":{"everyone":["!*","!0"]},"allow":["@everyone"]}"#,
+    )
+    .unwrap();
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:1::")));
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a::")));
+    let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["!*"]}"#).unwrap();
+    assert!(c.allow.is_empty());
+}
