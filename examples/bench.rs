@@ -7,10 +7,7 @@ const PREFIX: identity::Prefix = [0xfd, 0x00, 0xde, 0xad, 0xbe, 0xef];
 
 /// No sites: this measures the encode, and a site lookup is a separate cost.
 fn scheme() -> identity::Scheme {
-    identity::Scheme {
-        prefix: PREFIX,
-        sites: Vec::new(),
-    }
+    identity::Scheme::new(PREFIX, Vec::new())
 }
 
 fn pl_header() -> Vec<u8> {

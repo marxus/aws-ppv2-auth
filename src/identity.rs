@@ -24,11 +24,17 @@
 use crate::cidr;
 use crate::ppv2;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// An onboarded tenant. 0xb1a spells "via" the way tailscale's own range does,
 /// and it is a KIND here rather than a second prefix -- one /48 holds all three.
 pub const KIND_SITE: u16 = 0x0b1a;
+/// The quarantine site: a source two sites claim resolves HERE, not to either
+/// claimant -- trust is revoked until the contest is fixed, but the traffic stays
+/// nameable ("!0" in a group admits it for examination) instead of silently
+/// riding as somebody. Not declarable in `sites`; only contests mint it.
+pub const SITE_CONTESTED: u16 = 0;
 pub const KIND_VPCE: u16 = 1;
 pub const KIND_ADDR: u16 = 4;
 
@@ -45,12 +51,143 @@ pub struct Site {
     pub cidrs: cidr::Set,
 }
 
-/// What a header is encoded against. Present iff the filter parses PPv2 itself.
+/// What a header is encoded against, plus the flat indices site matching runs on.
+/// Built ONCE at config load (Scheme::new); the per-connection path never touches
+/// the per-site structures.
 #[derive(Debug)]
 pub struct Scheme {
     pub prefix: Prefix,
+    /// The parse artifact, kept for inspection; matching uses the indices below.
     /// Empty means nothing is onboarded, so every header falls to kind 1 or 4.
     pub sites: Vec<Site>,
+    /// vpce bytes -> site id. O(1); a label two sites list resolves to site 0.
+    vpce_index: HashMap<Box<[u8]>, u16>,
+    /// All sites' ranges flattened DISJOINT: overlaps split at boundaries, a
+    /// segment with one claimant keeps its id and a contested one gets site 0,
+    /// adjacent same-id merged. One binary search per lookup, whatever the count.
+    segments: Vec<(u128, u128, u16)>,
+}
+
+impl Scheme {
+    pub fn new(prefix: Prefix, mut sites: Vec<Site>) -> Scheme {
+        // Sorted for deterministic warnings; contests resolve to site 0 either way.
+        sites.sort_unstable_by_key(|s| s.id);
+
+        let mut vpce_index: HashMap<Box<[u8]>, u16> = HashMap::new();
+        for site in &sites {
+            for v in &site.vpce {
+                match vpce_index.entry(v.clone()) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(site.id);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        // Same site twice is harmless; a second site is a contest.
+                        if *e.get() != site.id && *e.get() != SITE_CONTESTED {
+                            eprintln!(
+                                "ppv2-auth: sites {} and {} both list {:?}; the label resolves to site 0 until fixed",
+                                e.get(),
+                                site.id,
+                                String::from_utf8_lossy(v),
+                            );
+                            e.insert(SITE_CONTESTED);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sweep: a range opens at start and closes AFTER end; the winner over any
+        // stretch is the lowest active id. end == MAX never closes (no +1 exists).
+        let mut events: Vec<(u128, bool, u16)> = Vec::new();
+        for site in &sites {
+            for (start, end) in site.cidrs.ranges() {
+                events.push((start, true, site.id));
+                if end < u128::MAX {
+                    events.push((end + 1, false, site.id));
+                }
+            }
+        }
+        events.sort_unstable();
+
+        let mut segments: Vec<(u128, u128, u16)> = Vec::new();
+        let mut active: BTreeMap<u16, u32> = BTreeMap::new();
+        let mut cur_start = 0u128;
+        let mut cur_id: Option<u16> = None;
+        let mut i = 0;
+        while i < events.len() {
+            let pos = events[i].0;
+            if let Some(id) = cur_id {
+                if pos > cur_start {
+                    segments.push((cur_start, pos - 1, id));
+                }
+            }
+            while i < events.len() && events[i].0 == pos {
+                let (_, open, id) = events[i];
+                if open {
+                    *active.entry(id).or_insert(0) += 1;
+                } else if let Some(c) = active.get_mut(&id) {
+                    *c -= 1;
+                    if *c == 0 {
+                        active.remove(&id);
+                    }
+                }
+                i += 1;
+            }
+            // One claimant is a site; two or more is a CONTEST, and a contest
+            // resolves to site 0 -- nobody's privileges, everybody's visibility.
+            cur_id = match active.len() {
+                0 => None,
+                1 => active.keys().next().copied(),
+                _ => {
+                    let claimants: Vec<String> =
+                        active.keys().map(|id| id.to_string()).collect();
+                    eprintln!(
+                        "ppv2-auth: sites {} contest addresses from {}; the range resolves to site 0 until fixed",
+                        claimants.join(", "),
+                        Ipv6Addr::from(pos.to_be_bytes()),
+                    );
+                    Some(SITE_CONTESTED)
+                }
+            };
+            cur_start = pos;
+        }
+        if let Some(id) = cur_id {
+            segments.push((cur_start, u128::MAX, id));
+        }
+        // Merge same-id neighbours the winner-change emission split needlessly.
+        let mut merged: Vec<(u128, u128, u16)> = Vec::with_capacity(segments.len());
+        for seg in segments {
+            match merged.last_mut() {
+                Some(last) if last.2 == seg.2 && last.1.wrapping_add(1) == seg.0 => last.1 = seg.1,
+                _ => merged.push(seg),
+            }
+        }
+
+        Scheme {
+            prefix,
+            sites,
+            vpce_index,
+            segments: merged,
+        }
+    }
+
+    /// The site whose space this address synthesizes into. One binary search.
+    fn addr_site(&self, addr: u128) -> Option<u16> {
+        let i = self.segments.partition_point(|s| s.0 <= addr);
+        (i > 0 && addr <= self.segments[i - 1].1).then(|| self.segments[i - 1].2)
+    }
+
+    /// The site owning EVERY address in [start, end] -- None on mixed or partial
+    /// ownership, because no single encoding would match what the wire does.
+    /// Adjacent same-id segments are merged, so one segment must cover it all.
+    fn range_site(&self, start: u128, end: u128) -> Option<u16> {
+        let i = self.segments.partition_point(|s| s.0 <= start);
+        (i > 0 && end <= self.segments[i - 1].1).then(|| self.segments[i - 1].2)
+    }
+
+    fn label_site(&self, label: &[u8]) -> Option<u16> {
+        self.vpce_index.get(label).copied()
+    }
 }
 
 /// A resolved site, and whether the header's source is the tenant's OWN address.
@@ -78,26 +215,18 @@ fn mapped(h: &ppv2::Header) -> u128 {
 /// a NAT in front of them, which is not an address in their space, so `inner` is
 /// false and the low 32 bits stay zero.
 ///
-/// Linear over sites, because each cidr::Set rejects out-of-span in one compare.
-/// ponytail: fine to low hundreds of tenants; sort the ranges across sites if that
-/// stops being true.
-fn site_of(sites: &[Site], h: &ppv2::Header) -> Option<SiteMatch> {
+/// One hash lookup + one binary search, whatever the site count -- this runs per
+/// datagram on UDP, so it must not be linear over sites. Contested sources are
+/// baked to site 0 in the indices at load.
+fn site_of(scheme: &Scheme, h: &ppv2::Header) -> Option<SiteMatch> {
     if !h.vpce.is_empty() {
-        if let Some(s) = sites.iter().find(|s| s.vpce.iter().any(|v| &**v == h.vpce)) {
-            return Some(SiteMatch {
-                id: s.id,
-                inner: true,
-            });
+        if let Some(id) = scheme.label_site(h.vpce) {
+            return Some(SiteMatch { id, inner: true });
         }
     }
-    let addr = mapped(h);
-    sites
-        .iter()
-        .find(|s| s.cidrs.contains(addr))
-        .map(|s| SiteMatch {
-            id: s.id,
-            inner: false,
-        })
+    scheme
+        .addr_site(mapped(h))
+        .map(|id| SiteMatch { id, inner: false })
 }
 
 /// Four cases, and the order matters.
@@ -106,7 +235,7 @@ pub fn synthesize(scheme: &Scheme, h: &ppv2::Header) -> [u8; 16] {
     out[..6].copy_from_slice(&scheme.prefix);
 
     // An onboarded tenant: kind b1a, then the site, then the machine.
-    if let Some(m) = site_of(&scheme.sites, h) {
+    if let Some(m) = site_of(scheme, h) {
         out[6..8].copy_from_slice(&KIND_SITE.to_be_bytes());
         out[10..12].copy_from_slice(&m.id.to_be_bytes());
         // Zero unless the source is the tenant's own address: <via>:0:<site>:: reads
@@ -244,14 +373,12 @@ pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, St
     // A site ref resolves only against a DECLARED site -- "!5" with no site 5 is
     // an unresolvable ref, and everything unresolvable is a label, same as
     // "@ghost". A site declared later (watch-fed) re-renders the config and the
-    // ref resolves then.
-    if let Some(id) = member
-        .strip_prefix('!')
-        .and_then(|t| t.parse::<u16>().ok())
-        .filter(|id| *id != 0)
-    {
+    // ref resolves then. "!0" always resolves: the quarantine space is
+    // system-owned, minted by contests rather than declared, and a group like
+    // `unknown-site: ["!0"]` is how contested traffic is admitted for examination.
+    if let Some(id) = member.strip_prefix('!').and_then(|t| t.parse::<u16>().ok()) {
         let sch = need()?;
-        if sch.sites.iter().any(|s| s.id == id) {
+        if id == SITE_CONTESTED || sch.sites.iter().any(|s| s.id == id) {
             return Ok(site_space(&sch.prefix, id));
         }
     }
@@ -273,7 +400,7 @@ pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, St
         // Mapped form, because that is how site cidrs hold v4.
         let base = 0xffff_0000_0000u128 | u32::from_be_bytes(v4.octets()) as u128;
         let (start, end) = range_of(base, 96 + b);
-        if let Some(id) = site_owning_range(&sch.sites, start, end) {
+        if let Some(id) = sch.range_site(start, end) {
             return Ok(site_space(&sch.prefix, id));
         }
         let mut out = [0u8; 16];
@@ -287,7 +414,7 @@ pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, St
         // those connections with the site space, so the config must too.
         if let Some(sch) = scheme {
             let (start, end) = range_of(to_u128(v6.octets()), b);
-            if let Some(id) = site_owning_range(&sch.sites, start, end) {
+            if let Some(id) = sch.range_site(start, end) {
                 return Ok(site_space(&sch.prefix, id));
             }
         }
@@ -295,7 +422,7 @@ pub fn encode_member(scheme: Option<&Scheme>, member: &str) -> Result<String, St
     }
 
     let sch = need()?;
-    if let Some(id) = site_owning_label(&sch.sites, member.as_bytes()) {
+    if let Some(id) = sch.label_site(member.as_bytes()) {
         return Ok(site_space(&sch.prefix, id));
     }
     let digest = Sha256::digest(member.as_bytes());
@@ -322,20 +449,4 @@ fn range_of(addr: u128, bits: u8) -> (u128, u128) {
     }
     let mask: u128 = u128::MAX << (128 - bits as u32);
     (addr & mask, (addr & mask) | !mask)
-}
-
-/// Sites arrive sorted by id (config.rs), so first match IS lowest-id-wins --
-/// the same tiebreak the packet path applies, so the two cannot disagree.
-fn site_owning_range(sites: &[Site], start: u128, end: u128) -> Option<u16> {
-    sites
-        .iter()
-        .find(|s| s.cidrs.contains_range(start, end))
-        .map(|s| s.id)
-}
-
-fn site_owning_label(sites: &[Site], label: &[u8]) -> Option<u16> {
-    sites
-        .iter()
-        .find(|s| s.vpce.iter().any(|v| &**v == label))
-        .map(|s| s.id)
 }

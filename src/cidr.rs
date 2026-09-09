@@ -41,6 +41,11 @@ impl Set {
         i > 0 && end <= self.ranges[i - 1].end
     }
 
+    /// The merged ranges, for building cross-set indices (identity.rs's segment map).
+    pub fn ranges(&self) -> impl Iterator<Item = (u128, u128)> + '_ {
+        self.ranges.iter().map(|r| (r.start, r.end))
+    }
+
     pub fn len(&self) -> usize {
         self.ranges.len()
     }

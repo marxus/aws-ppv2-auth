@@ -217,11 +217,11 @@ fn classify(member: &str) -> Result<Option<String>, String> {
 }
 
 fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>, String> {
-    let mut sites = raw
+    let sites = raw
         .into_iter()
         .map(|(key, sources)| {
-            // 0 is not reserved for anything, but tailscale renders it as the bare
-            // prefix, which reads as "no site" -- so refuse it rather than emit it.
+            // Site 0 is the system's: contested sources resolve there (identity.rs
+            // SITE_CONTESTED), so no tenant may declare it.
             let id = key
                 .parse::<u16>()
                 .ok()
@@ -248,11 +248,8 @@ fn build_sites(raw: BTreeMap<String, Vec<String>>) -> Result<Vec<identity::Site>
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    // Sorted NUMERICALLY (the map iterates its string keys lexically: "10" < "2")
-    // so first-match iteration is lowest-id-wins -- the one tiebreak for a source
-    // two sites claim, applied identically at packet time (site_of) and config
-    // time (encode_member), so the two can never disagree.
-    sites.sort_unstable_by_key(|s| s.id);
+    // No ordering promise here -- Scheme::new sorts and bakes lowest-id-wins into
+    // its indices, one tiebreak applied identically at packet and config time.
     Ok(sites)
 }
 
@@ -267,10 +264,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         None => None,
     };
     let scheme = match prefix {
-        Some(p) => Some(identity::Scheme {
-            prefix: p,
-            sites: build_sites(raw.sites)?,
-        }),
+        Some(p) => Some(identity::Scheme::new(p, build_sites(raw.sites)?)),
         None => {
             if !raw.sites.is_empty() {
                 return Err("`sites` needs `ula`; it describes how a header is encoded".to_string());

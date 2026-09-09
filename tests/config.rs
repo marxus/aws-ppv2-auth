@@ -573,12 +573,13 @@ fn a_site_ref_encodes_the_whole_site_space() {
     assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:1:a01:1")));
     assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:7::")));
     assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:2::")));
-    // Unresolvable site refs are labels, exactly like "@ghost": bad syntax ("!x",
-    // "!0") and an id no site declares ("!5"). A site declared later re-renders
-    // the config and the ref resolves then.
+    // Unresolvable site refs are labels, exactly like "@ghost": bad syntax ("!x")
+    // and an id no site declares ("!5"). A site declared later re-renders the
+    // config and the ref resolves then. "!0" is the exception -- the quarantine
+    // space is system-owned and always nameable, contests mint it.
     let c = config::parse(r#"{"ula":"fd00:dead:beef::/48","allow":["!x","!0","!5"]}"#).unwrap();
-    assert_eq!(c.allow.len(), 3); // three hashes, no site space
-    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a::")));
+    assert_eq!(c.allow.len(), 3); // two hashes + the quarantine /96
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a::")));
     assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:5::")));
 }
 
@@ -616,15 +617,17 @@ fn a_range_only_partly_inside_a_site_stays_a_lift() {
 }
 
 #[test]
-fn a_source_two_sites_claim_goes_to_the_lower_id() {
-    // One tiebreak, applied identically at packet time and config time: sites are
-    // sorted by id at load, first match wins.
+fn a_source_two_sites_claim_is_contested_and_goes_to_site_0() {
+    // Neither claimant gets it -- trust is revoked into the quarantine space, and
+    // packet time agrees, so contested traffic rides as NOBODY's privileges but
+    // stays admittable via "!0" for examination.
     let c = config::parse(
         r#"{"ula":"fd00:dead:beef::/48",
             "sites":{"9":["vpce-shared"],"3":["vpce-shared"]},
             "allow":["vpce-shared"]}"#,
     )
     .unwrap();
-    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a:0:3::")));
+    assert!(c.permits_unscoped(ip("fd00:dead:beef:b1a::")));
+    assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:3::")));
     assert!(!c.permits_unscoped(ip("fd00:dead:beef:b1a:0:9::")));
 }

@@ -35,17 +35,14 @@ fn hdr_v6<'a>(vpce: &'a [u8], addr: &str) -> ppv2::Header<'a> {
 
 /// No site table: everything falls to the ULA, which is the pre-v0.6.0 behaviour.
 fn plain() -> Scheme {
-    Scheme {
-        prefix: TEST_PREFIX,
-        sites: Vec::new(),
-    }
+    Scheme::new(TEST_PREFIX, Vec::new())
 }
 
 /// Site 7 by endpoint id, site 2 by NAT prefix -- the two ways a tenant is named.
 fn with_sites() -> Scheme {
-    Scheme {
-        prefix: TEST_PREFIX,
-        sites: vec![
+    Scheme::new(
+        TEST_PREFIX,
+        vec![
             Site {
                 id: 7,
                 vpce: vec![b"vpce-0123456789abcdef0".to_vec().into_boxed_slice()],
@@ -58,7 +55,7 @@ fn with_sites() -> Scheme {
                 cidrs: cidr::build("::ffff:203.0.113.0/120").unwrap(),
             },
         ],
-    }
+    )
 }
 
 // --- the site space ---------------------------------------------------------
@@ -101,17 +98,24 @@ fn an_onboarded_tenant_over_ipv6_has_no_ipv4_to_carry() {
 
 #[test]
 fn the_whole_site_range_fits_in_group_six() {
-    let mut s = with_sites();
-    s.sites[0].id = 65535;
+    let s = Scheme::new(
+        TEST_PREFIX,
+        vec![Site {
+            id: 65535,
+            vpce: vec![b"vpce-0123456789abcdef0".to_vec().into_boxed_slice()],
+            cidrs: cidr::build("").unwrap(),
+        }],
+    );
     let a = synthesize(&s, &hdr_v4(b"vpce-0123456789abcdef0", [10, 0, 1, 28]));
     assert_eq!(format(a).as_str(), "fd00:dead:beef:b1a:0:ffff:a00:11c");
 }
 
 #[test]
 fn an_empty_site_table_sends_everything_to_the_other_kinds() {
-    // There is no second prefix to withhold any more: sites alone decide.
-    let mut sc = with_sites();
-    sc.sites.clear();
+    // There is no second prefix to withhold any more: sites alone decide. Built
+    // fresh, not mutated -- Scheme::new bakes the match indices at construction,
+    // and `sites` after that is a parse artifact, not the matcher.
+    let sc = Scheme::new(TEST_PREFIX, Vec::new());
     let a = synthesize(&sc, &hdr_v4(b"vpce-0123456789abcdef0", [10, 0, 1, 28]));
     assert_eq!(u16::from_be_bytes([a[6], a[7]]), KIND_VPCE);
 }
@@ -233,14 +237,14 @@ fn an_ipv6_client_cannot_collide_with_an_ipv4_rule() {
 fn an_ipv6_site_prefix_matches_a_v6_client() {
     // sites take v6 prefixes too, and a v6 client is tested as itself rather than
     // through the ::ffff: lift.
-    let s = Scheme {
-        prefix: TEST_PREFIX,
-        sites: vec![Site {
+    let s = Scheme::new(
+        TEST_PREFIX,
+        vec![Site {
             id: 9,
             vpce: Vec::new(),
             cidrs: cidr::build("2001:db8::/32").unwrap(),
         }],
-    };
+    );
     let a = synthesize(&s, &hdr_v6(b"", "2001:db8::1"));
     assert_eq!(format(a).as_str(), "fd00:dead:beef:b1a:0:9::");
 }
@@ -319,4 +323,41 @@ fn a_site_owned_source_and_the_wire_meet_in_site_space() {
     assert!(covers("!2", &hdr_v4(b"", [203, 0, 113, 9])));
     assert!(covers("203.0.113.0/24", &hdr_v4(b"", [203, 0, 113, 9])));
     assert!(!covers("!2", &hdr_v4(b"", [203, 0, 114, 9])));
+}
+
+#[test]
+fn overlapping_site_ranges_split_and_the_contest_goes_to_site_0() {
+    // Site 9 claims 203.0.113.0/24; site 3 claims the upper half. The flat index
+    // splits at the boundary: lower half -> 9 (sole claimant), upper half ->
+    // site 0 (contested -- neither claimant's privileges). Wire and config agree
+    // everywhere, including the honest answer for a member spanning both zones:
+    // nobody -- no single encoding could match.
+    let s = Scheme::new(
+        TEST_PREFIX,
+        vec![
+            Site {
+                id: 9,
+                vpce: Vec::new(),
+                cidrs: cidr::build("::ffff:203.0.113.0/120").unwrap(),
+            },
+            Site {
+                id: 3,
+                vpce: Vec::new(),
+                cidrs: cidr::build("::ffff:203.0.113.128/121").unwrap(),
+            },
+        ],
+    );
+
+    // Wire: sole zone -> the site; contested zone -> quarantine.
+    let low = synthesize(&s, &hdr_v4(b"", [203, 0, 113, 5]));
+    let high = synthesize(&s, &hdr_v4(b"", [203, 0, 113, 200]));
+    assert_eq!(format(low).as_str(), "fd00:dead:beef:b1a:0:9::");
+    assert_eq!(format(high).as_str(), "fd00:dead:beef:b1a::");
+
+    // Config: same three answers -- site, quarantine, and a spanning range that
+    // encodes as the kind-4 lift because it crosses zones.
+    let enc = |m: &str| identity::encode_member(Some(&s), m).unwrap();
+    assert_eq!(enc("203.0.113.0/25"), "fd00:dead:beef:b1a:0:9::/96");
+    assert_eq!(enc("203.0.113.128/25"), "fd00:dead:beef:b1a::/96");
+    assert_eq!(enc("203.0.113.0/24"), "fd00:dead:beef:4::cb00:7100/120");
 }
