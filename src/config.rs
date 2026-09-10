@@ -166,11 +166,17 @@ fn eq_fold(pat: &str, sni: &[u8]) -> bool {
 }
 
 /// ServerNameMatcher order (domain_matcher.h:78-101): exact, then wildcards
-/// longest-suffix-first. Empty SNI claims nothing (domain_matcher.h:74-76).
+/// longest-suffix-first.
+///
+/// DELIBERATE DIVERGENCE from domain_matcher.h:74-76, which makes empty SNI claim
+/// nothing: here an absent SNI falls through to the exact loop, so a scope naming
+/// `""` (Pattern::Exact("")) can claim the no-SNI lane -- a NON-SNI client (raw
+/// TLS to an IP, some DB protocols) still needs an identity, but can be admitted
+/// on purpose. It is NOT a wildcard: a present-but-unmatched SNI still denies
+/// (the loops below miss it and return None), and `Exact("")` only ever matches a
+/// zero-length name. No `""` scope => empty SNI still dies. Do not re-add the
+/// short-circuit; it silently removes the ability to name the no-SNI lane.
 pub fn match_scopes<'a>(scopes: &'a [Scope], sni: &[u8]) -> Option<&'a cidr::Set> {
-    if sni.is_empty() {
-        return None;
-    }
     for s in scopes {
         if s.names
             .iter()

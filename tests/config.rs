@@ -494,3 +494,28 @@ fn enforcers_follow_the_published_table() {
     assert!(!consumer.permits_unscoped(ip("fd00:dead:beef:4::cb00:7107")));
     assert!(consumer.permits_unscoped(ip("fd00:dead:beef:b1a:0:1:a01:1")));
 }
+
+#[test]
+fn an_empty_string_scope_claims_the_no_sni_lane() {
+    // A scope named "" admits connections that sent NO SNI (raw TLS to an IP, some
+    // DB protocols) -- still identity-gated, opt-in, and NOT a wildcard: a present
+    // SNI with no matching scope still denies.
+    let t = table(r#"{"ula":"fd00:dead:beef::/48","sites":{"1":["vpce-a"]}}"#);
+    let j = judged(
+        r#"{"scopes":[
+            {"sni":[""],"allow":["!1"]},
+            {"sni":["l7.mgmt.test"],"allow":["fd00:dead:beef:1::/64"]}]}"#,
+        &t,
+    );
+    // No SNI -> the "" scope claims it.
+    assert!(j.permits(b"", ip("fd00:dead:beef:b1a:0:1::5")));
+    assert!(!j.permits(b"", ip(OTHER)));               // still identity-gated
+    // Named SNI still routes to its own scope, unaffected.
+    assert!(j.permits(b"l7.mgmt.test", ip(TENANT)));
+    // A present-but-unmatched SNI is NOT caught by "" -- it denies.
+    assert!(!j.permits(b"stranger.test", ip("fd00:dead:beef:b1a:0:1::5")));
+
+    // And without a "" scope, no SNI still dies -- fail-closed preserved.
+    let j2 = judged(r#"{"scopes":[{"sni":["l7.mgmt.test"],"allow":["!1"]}]}"#, &t);
+    assert!(!j2.permits(b"", ip("fd00:dead:beef:b1a:0:1::5")));
+}
